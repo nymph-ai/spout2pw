@@ -1,6 +1,6 @@
 [submodule "subprojects/libfunnel"]
 	path = subprojects/libfunnel
-	url = https://github.com/hoshinolina/libfunnel
+	url = https://github.com/nymph-ai/libfunnel
 
 [submodule "subprojects/pipewire-static"]
 	path = subprojects/pipewire-static
