@@ -6,6 +6,7 @@ base="$(realpath $(dirname "$0"))"
 builddir="$base/build"
 pw_builddir="$base/build-pw"
 pw_srcdir="$base/subprojects/pipewire-static"
+enable_egl_backend="${SPOUT2PW_ENABLE_EGL_BACKEND:-false}"
 
 mkdir -p "$pw_builddir"
 
@@ -59,6 +60,7 @@ meson setup \
     --native-file "$builddir/native.txt" \
     --cross-file "$base"/misc/x86_64-w64-mingw32.txt \
     -Dlibpipewire_static_lib="$builddir/prefix/usr/lib/libpipewire-static-0.3.a" \
+    -Denable_egl_backend="$enable_egl_backend" \
     "$builddir" "$base" || { cat build/meson-logs/meson-log.txt; false; }
 
 ninja -C "$builddir" install

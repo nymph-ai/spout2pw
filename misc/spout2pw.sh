@@ -414,6 +414,36 @@ prepare_proton() {
 }
 
 setup_env() {
+    prepend_path_var() {
+        local var_name="$1"
+        local path_entry="$2"
+        local current_value="${!var_name-}"
+
+        [ -n "$path_entry" ] || return 0
+        case ":$current_value:" in
+            *":$path_entry:"*) return 0 ;;
+        esac
+
+        if [ -n "$current_value" ]; then
+            printf -v "$var_name" '%s:%s' "$path_entry" "$current_value"
+        else
+            printf -v "$var_name" '%s' "$path_entry"
+        fi
+        export "$var_name"
+    }
+
+    proton_unixlib_dirs="
+        $protonpath/files/lib/wine/x86_64-unix
+        $protonpath/files/lib/wine/i386-unix
+    "
+    for unixlib_dir in $proton_unixlib_dirs; do
+        [ -d "$unixlib_dir" ] || continue
+        prepend_path_var LD_LIBRARY_PATH "$unixlib_dir"
+        prepend_path_var PRESSURE_VESSEL_APP_LD_LIBRARY_PATH "$unixlib_dir"
+    done
+    [ -n "${LD_LIBRARY_PATH:-}" ] && export SYSTEM_LD_LIBRARY_PATH="$LD_LIBRARY_PATH"
+    [ -n "${LD_LIBRARY_PATH:-}" ] && export ORIG_LD_LIBRARY_PATH="${ORIG_LD_LIBRARY_PATH:-$LD_LIBRARY_PATH}"
+
     export WINEDLLPATH="$spout2pw/spout2pw-dlls"
     if [ "$enable_debug" = 1 ]; then
         export PROTON_LOG=+spout2pw
@@ -489,4 +519,3 @@ main() {
 main "$@"
 ret="$?"
 [ "$ret" != 0 ] && fatal "Unknown error $ret, see terminal log"
-

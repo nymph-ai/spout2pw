@@ -521,6 +521,13 @@ free:
 }
 
 static DWORD WINAPI sendernames_thread(void *arg) {
+    /*
+     * WARNING: Actaeid VTuber PipeWire video contract is exactly one source and
+     * one sink: source family=`Warudo -> Spout2PW` (exactly one matching
+     * sender/node), sink family=`OBS pipewire-video-source` (exactly one
+     * matching consumer node). Do not generalize this sender loop into a
+     * multi-source fan-out or add fallback capture paths here.
+     */
     TRACE("Sendernames thread started\n");
 
     SPOUTDXTOC_NAMELIST list = {0};

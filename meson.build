@@ -2,6 +2,8 @@ project('spout2pw', 'c',
     meson_version: '>=1.1'
 )
 
+enable_egl_backend = get_option('enable_egl_backend')
+
 if not meson.is_cross_build()
     error('must be invoked with "meson setup --cross-file=./x86_64-w64-mingw32.txt"')
 endif
@@ -58,7 +60,7 @@ libfunnel_proj = subproject(
   default_options: [
     'native=true',
     'test_apps=false',
-    'egl=false',
+    'egl=' + (enable_egl_backend ? 'true' : 'false'),
     'default_library=static',
     'static_pipewire=true',
   ]
@@ -66,6 +68,9 @@ libfunnel_proj = subproject(
 
 funnel = libfunnel_proj.get_variable('funnel')
 funnel_vk = libfunnel_proj.get_variable('funnel_vk')
+if enable_egl_backend
+  funnel_egl = libfunnel_proj.get_variable('funnel_egl')
+endif
 
 windows_src = [
   'src/spout2pw.c',
@@ -84,8 +89,12 @@ windows_compiler_args = [
 
 windows_link_args = [ ]
 unix_compiler_args = [ '-DWINE_UNIX_LIB' ] + unix_include_args
+if enable_egl_backend
+  unix_compiler_args += [ '-DSPOUT2PW_ENABLE_EGL_BACKEND=1' ]
+endif
 unix_link_args = [
   '-l:ntdll.so',
+  '-Wl,-rpath,/opt/proton/current/files/lib/wine/x86_64-unix',
   '-Wl,--whole-archive',
   '-Wl,' + get_option('libpipewire_static_lib'),
   '-Wl,--no-whole-archive',
@@ -106,6 +115,20 @@ unix_deps = [
   funnel_vk,
   vulkan,
 ]
+if enable_egl_backend
+  egl = dependency('egl', native: true)
+  gl = dependency('GL', native: true)
+  x11 = dependency('x11', native: true)
+  glew = dependency('glew', native: true)
+
+  unix_deps += [
+    funnel_egl,
+    egl,
+    gl,
+    x11,
+    glew,
+  ]
+endif
 
 foreach p : unix_lib_paths
   unix_link_args += ['-L' + p]
