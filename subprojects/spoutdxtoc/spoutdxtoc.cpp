@@ -1,6 +1,10 @@
 #include "spoutdxtoc.h"
+#include "actaeid_pipewire_video_contract.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -36,8 +40,146 @@ struct SpoutDXToCReceiver {
     bool dx_open;
 };
 
+static std::vector<std::string> collect_allowed_sender_names(
+    spoutSenderNames &sendernames) {
+    std::vector<std::string> senderlist;
+
+    const int nSenders = sendernames.GetSenderCount();
+    if (nSenders <= 0)
+        return senderlist;
+
+    char sendername[256]{};
+    for (int i = 0; i < nSenders; i++) {
+        if (!sendernames.GetSender(i, sendername))
+            continue;
+
+        std::string candidate(sendername);
+        if (actaeid::pipewire_video_contract::AllowsSourceName(candidate))
+            senderlist.push_back(candidate);
+    }
+
+    return senderlist;
+}
+
+static std::string configured_contract_sender_name() {
+    {
+        std::ifstream file("C:\\spout2pw-selected-sender.txt");
+        if (file.good()) {
+            std::string value;
+            std::getline(file, value);
+            while (!value.empty() &&
+                   (value.back() == '\r' || value.back() == '\n' ||
+                    value.back() == ' ' || value.back() == '\t')) {
+                value.pop_back();
+            }
+            if (!value.empty())
+                return value;
+        }
+    }
+
+    const char *env_name =
+        actaeid::pipewire_video_contract::SourceSelectedSenderEnvVar();
+    DWORD required = GetEnvironmentVariableA(env_name, nullptr, 0);
+    if (required > 1) {
+        std::string value(required - 1, '\0');
+        if (GetEnvironmentVariableA(env_name, &value[0], required) ==
+            required - 1) {
+            return value;
+        }
+    }
+
+    const char *raw =
+        std::getenv(env_name);
+    if (!raw || !raw[0])
+        return {};
+
+    return std::string(raw);
+}
+
+static std::string active_allowed_sender_name(
+    spoutSenderNames &sendernames,
+    const std::vector<std::string> &senderlist) {
+    char active_sender[256]{};
+    if (!sendernames.GetActiveSender(active_sender, sizeof(active_sender)))
+        return {};
+
+    const std::string active(active_sender);
+    const auto it = std::find(senderlist.begin(), senderlist.end(), active);
+    if (it == senderlist.end())
+        return {};
+
+    return *it;
+}
+
+static bool allows_contract_receiver_name(const std::string &sender_name) {
+    if (!actaeid::pipewire_video_contract::AllowsSourceName(sender_name))
+        return false;
+
+    const auto configured_sender = configured_contract_sender_name();
+    if (configured_sender.empty())
+        return true;
+
+    return sender_name == configured_sender;
+}
+
+static std::vector<std::string> select_contract_sender_names(
+    spoutSenderNames &sendernames) {
+    const auto senderlist = collect_allowed_sender_names(sendernames);
+    const auto configured_sender = configured_contract_sender_name();
+    if (!configured_sender.empty()) {
+        const auto it =
+            std::find(senderlist.begin(), senderlist.end(), configured_sender);
+        if (it != senderlist.end())
+            return {*it};
+    } else if (senderlist.size() ==
+               actaeid::pipewire_video_contract::Contract::kSourceCount) {
+        return senderlist;
+    } else {
+        const auto active_sender = active_allowed_sender_name(sendernames, senderlist);
+        if (!active_sender.empty())
+            return {active_sender};
+    }
+
+    std::string names;
+    for (size_t i = 0; i < senderlist.size(); i++) {
+        if (i != 0)
+            names += ", ";
+        names += senderlist[i];
+    }
+
+    if (!configured_sender.empty()) {
+        SpoutLogError(
+            "%s Contract violation for %s: expected selected sender %s=%s "
+            "within family prefix '%s', found %zu matching senders [%s].",
+            actaeid::pipewire_video_contract::Warning(),
+            actaeid::pipewire_video_contract::SourceFamilyName(),
+            actaeid::pipewire_video_contract::SourceSelectedSenderEnvVar(),
+            configured_sender.c_str(),
+            actaeid::pipewire_video_contract::SourceSenderPrefix(),
+            senderlist.size(), names.empty() ? "(none)" : names.c_str());
+    } else {
+        SpoutLogError(
+            "%s Contract violation for %s: no unique sender could be selected "
+            "from family prefix '%s'. Found %zu matching senders [%s]. Set %s "
+            "to one exact sender name to resolve the ambiguity.",
+            actaeid::pipewire_video_contract::Warning(),
+            actaeid::pipewire_video_contract::SourceFamilyName(),
+            actaeid::pipewire_video_contract::SourceSenderPrefix(),
+            senderlist.size(), names.empty() ? "(none)" : names.c_str(),
+            actaeid::pipewire_video_contract::SourceSelectedSenderEnvVar());
+    }
+    return {};
+}
+
 SPOUTDXTOC_SENDERNAMES *__stdcall SpoutDXToCNewSenderNames(void) {
     spoututils::EnableSpoutLogFile("C:\\spoutlog.txt");
+    SpoutLogNotice("%s", actaeid::pipewire_video_contract::Warning());
+    const auto configured_sender = configured_contract_sender_name();
+    if (!configured_sender.empty()) {
+        SpoutLogNotice("Configured contract sender: %s=%s",
+                       actaeid::pipewire_video_contract::SourceSelectedSenderEnvVar(),
+                       configured_sender.c_str());
+    }
     SPOUTDXTOC_SENDERNAMES *p = new SpoutDXToCSenderNames();
     return p;
 }
@@ -51,7 +193,7 @@ void __stdcall SpoutDXToCFreeSenderNames(SPOUTDXTOC_SENDERNAMES *self) {
 int __stdcall SpoutDXToCGetSenderCount(SPOUTDXTOC_SENDERNAMES *self) {
     assert(self != NULL);
 
-    return self->sendernames.GetSenderCount();
+    return static_cast<int>(select_contract_sender_names(self->sendernames).size());
 }
 
 #define NAME_MAX_SIZE 256
@@ -61,15 +203,13 @@ bool __stdcall SpoutDXToCGetSender(SPOUTDXTOC_SENDERNAMES *self, int64_t index,
     assert(self != NULL);
     assert(sendername != NULL && *sendername == NULL);
 
+    auto senderlist = select_contract_sender_names(self->sendernames);
+    if (index < 0 || static_cast<size_t>(index) >= senderlist.size())
+        return false;
+
     *sendername = (char *)calloc(1, NAME_MAX_SIZE * sizeof(char));
-
-    if (self->sendernames.GetSender((int)index, *sendername, NAME_MAX_SIZE))
-        return true;
-
-    free(*sendername);
-    *sendername = NULL;
-
-    return false;
+    strncpy(*sendername, senderlist[index].c_str(), NAME_MAX_SIZE - 1);
+    return true;
 }
 
 static void vec_to_null_term_clist(std::vector<std::string> &vector,
@@ -94,15 +234,7 @@ char **__stdcall SpoutDXToCGetSenderListSimple(SPOUTDXTOC_SENDERNAMES *self,
     char **list = NULL;
 
     assert(self != NULL);
-
-    int nSenders = self->sendernames.GetSenderCount();
-    if (nSenders > 0) {
-        char sendername[256]{};
-        for (int i = 0; i < nSenders; i++) {
-            if (self->sendernames.GetSender(i, sendername))
-                senderlist.push_back(sendername);
-        }
-    }
+    senderlist = select_contract_sender_names(self->sendernames);
 
     vec_to_null_term_clist(senderlist, &list);
 
@@ -143,14 +275,7 @@ bool __stdcall SpoutDXToCGetSenderList(SPOUTDXTOC_SENDERNAMES *self,
         assert(ret_removed == NULL || ret_removed->list == NULL);
     }
 
-    int nSenders = self->sendernames.GetSenderCount();
-    if (nSenders > 0) {
-        char sendername[256]{};
-        for (int i = 0; i < nSenders; i++) {
-            if (self->sendernames.GetSender(i, sendername))
-                list.push_back(sendername);
-        }
-    }
+    list = select_contract_sender_names(self->sendernames);
     senderlist = list;
 
     for (size_t i = 0; i < old_list->count; i++) {
@@ -185,6 +310,25 @@ bool __stdcall SpoutDXToCGetSenderList(SPOUTDXTOC_SENDERNAMES *self,
 }
 
 SPOUTDXTOC_RECEIVER *__stdcall SpoutDXToCNewReceiver(const char *SenderName) {
+    if (!SenderName || !allows_contract_receiver_name(SenderName)) {
+        const auto configured_sender = configured_contract_sender_name();
+        if (!configured_sender.empty()) {
+            SpoutLogError(
+                "%s Refusing sender '%s' because %s=%s requires one exact "
+                "sender selection.",
+                actaeid::pipewire_video_contract::Warning(),
+                SenderName ? SenderName : "(null)",
+                actaeid::pipewire_video_contract::SourceSelectedSenderEnvVar(),
+                configured_sender.c_str());
+        } else {
+            SpoutLogError("%s Refusing sender '%s' outside source family %s.",
+                          actaeid::pipewire_video_contract::Warning(),
+                          SenderName ? SenderName : "(null)",
+                          actaeid::pipewire_video_contract::SourceFamilyName());
+        }
+        return nullptr;
+    }
+
     SPOUTDXTOC_RECEIVER *p = new SpoutDXToCReceiver();
 
     InitializeCriticalSection(&p->cs);

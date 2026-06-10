@@ -1,2 +1,5 @@
 option('libpipewire_static_lib',
        type : 'string')
+option('enable_egl_backend',
+       type : 'boolean',
+       value : false)

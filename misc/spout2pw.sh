@@ -263,6 +263,7 @@ setup_steam() {
 
     launch_cmd=()
     steam_runtime=0
+    runtimepath=
 
     log "Args: $*"
 
@@ -290,7 +291,10 @@ setup_steam() {
 
     run_in_prefix() {
         log "run_in_prefix: $@"
-        "${launch_cmd[@]}" run "$@"
+
+        local prefix_cmd=("${launch_cmd[@]}" run "$@")
+        wrap_steam_runtime_command "${prefix_cmd[@]}"
+        "${wrapped_cmd[@]}"
     }
 
     if [ -z "$SPOUT2PW_INSTANCE" ]; then
@@ -299,6 +303,68 @@ setup_steam() {
         elif [ ! -z "$STEAM_COMPAT_APP_ID" ]; then
             export SPOUT2PW_INSTANCE="Spout2PW-$STEAM_COMPAT_APP_ID"
         fi
+    fi
+}
+
+build_spout2pw_runtime_env_args() {
+    spout2pw_runtime_env_args=()
+
+    add_runtime_env() {
+        local name="$1"
+        local value="${!name-}"
+
+        [ -n "$value" ] || return 0
+        spout2pw_runtime_env_args+=("--env=$name=$value")
+    }
+
+    add_runtime_env WINEDLLPATH
+    add_runtime_env SPOUT2PW_APPNAME
+    add_runtime_env SPOUT2PW_INSTANCE
+    add_runtime_env SPOUT2PW_OUTPUT_BACKEND
+    add_runtime_env SPOUT2PW_FPS
+    add_runtime_env SPOUT2PW_VALIDATION
+    add_runtime_env SPOUT2PW_STANDALONE
+    add_runtime_env SPOUT2PW_NODE_PREFIX
+    add_runtime_env SPOUT2PW_SENDER_NAME
+    add_runtime_env PIPEWIRE_CONTRACT_EXPECTED_SENDER_NAME
+
+    if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+        spout2pw_runtime_env_args+=("--set-ld-library-path=$LD_LIBRARY_PATH")
+    fi
+}
+
+wrap_steam_runtime_command() {
+    wrapped_cmd=()
+
+    if [ "${steam_runtime:-0}" != 1 ]; then
+        wrapped_cmd=("$@")
+        return
+    fi
+
+    local pv_adverb="${runtimepath:-}/pressure-vessel/libexec/steam-runtime-tools-0/pv-adverb"
+    if [ ! -x "$pv_adverb" ]; then
+        log "Could not find pv-adverb at '$pv_adverb'; launching without Steam Runtime environment injection"
+        wrapped_cmd=("$@")
+        return
+    fi
+
+    build_spout2pw_runtime_env_args
+
+    local inserted=0
+    local arg=
+    for arg in "$@"; do
+        if [ "$inserted" = 0 ] && [[ "$arg" == */proton ]]; then
+            wrapped_cmd+=("$pv_adverb")
+            wrapped_cmd+=("${spout2pw_runtime_env_args[@]}")
+            wrapped_cmd+=("$arg")
+            inserted=1
+        else
+            wrapped_cmd+=("$arg")
+        fi
+    done
+
+    if [ "$inserted" = 0 ]; then
+        log "Could not find Proton in Steam Runtime command; launching without environment injection"
     fi
 }
 
@@ -414,6 +480,51 @@ prepare_proton() {
 }
 
 setup_env() {
+    prepend_path_var() {
+        local var_name="$1"
+        local path_entry="$2"
+        local current_value="${!var_name-}"
+
+        [ -n "$path_entry" ] || return 0
+        case ":$current_value:" in
+            *":$path_entry:"*) return 0 ;;
+        esac
+
+        if [ -n "$current_value" ]; then
+            printf -v "$var_name" '%s:%s' "$path_entry" "$current_value"
+        else
+            printf -v "$var_name" '%s' "$path_entry"
+        fi
+        export "$var_name"
+    }
+
+    proton_unixlib_dirs="
+        $protonpath/files/lib/wine/x86_64-unix
+        $protonpath/files/lib/wine/i386-unix
+    "
+    for unixlib_dir in $proton_unixlib_dirs; do
+        [ -d "$unixlib_dir" ] || continue
+        prepend_path_var LD_LIBRARY_PATH "$unixlib_dir"
+        prepend_path_var PRESSURE_VESSEL_APP_LD_LIBRARY_PATH "$unixlib_dir"
+    done
+
+    # The EGL backend links against host GL/X11 libraries. Steam's pressure
+    # vessel does not consistently expose those paths to the Wine service
+    # process, so pass them through explicitly with the app library path.
+    host_lib_dirs="
+        /usr/local/lib/x86_64-linux-gnu
+        /usr/lib/x86_64-linux-gnu
+        /lib/x86_64-linux-gnu
+    "
+    for host_lib_dir in $host_lib_dirs; do
+        [ -d "$host_lib_dir" ] || continue
+        prepend_path_var LD_LIBRARY_PATH "$host_lib_dir"
+        prepend_path_var PRESSURE_VESSEL_APP_LD_LIBRARY_PATH "$host_lib_dir"
+    done
+
+    [ -n "${LD_LIBRARY_PATH:-}" ] && export SYSTEM_LD_LIBRARY_PATH="$LD_LIBRARY_PATH"
+    [ -n "${LD_LIBRARY_PATH:-}" ] && export ORIG_LD_LIBRARY_PATH="${ORIG_LD_LIBRARY_PATH:-$LD_LIBRARY_PATH}"
+
     export WINEDLLPATH="$spout2pw/spout2pw-dlls"
     if [ "$enable_debug" = 1 ]; then
         export PROTON_LOG=+spout2pw
@@ -477,11 +588,12 @@ main() {
 
     validate_paths
     prepare_proton
-    prepare_prefix
     setup_env
+    prepare_prefix
 
+    wrap_steam_runtime_command "$@"
     ret=0
-    "$@" || ret="$?"
+    "${wrapped_cmd[@]}" || ret="$?"
     log "Command exit status: $ret"
     exit $ret
 }
@@ -489,4 +601,3 @@ main() {
 main "$@"
 ret="$?"
 [ "$ret" != 0 ] && fatal "Unknown error $ret, see terminal log"
-

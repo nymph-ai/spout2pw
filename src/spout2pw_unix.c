@@ -7,14 +7,35 @@
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#ifdef SPOUT2PW_ENABLE_EGL_BACKEND
+#include <GL/glew.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#endif
 #include <vulkan/vulkan.h>
 
+#ifdef SPOUT2PW_ENABLE_EGL_BACKEND
+#include <funnel-egl.h>
+#endif
 #include <funnel-vk.h>
 #include <funnel.h>
 
 #include "spout2pw_unix.h"
 #include "wine/debug.h"
 #include <ntstatus.h>
+
+#ifdef SPOUT2PW_ENABLE_EGL_BACKEND
+#include <X11/Xlib.h>
+
+#ifdef Status
+#undef Status
+#endif
+
+#ifdef ControlMask
+#undef ControlMask
+#endif
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(spout2pw);
 
@@ -71,12 +92,35 @@ WINE_DEFAULT_DEBUG_CHANNEL(spout2pw);
 static struct startup_params startup_params = {0};
 struct funnel_ctx *funnel;
 
+enum output_backend {
+    OUTPUT_BACKEND_VULKAN,
+#ifdef SPOUT2PW_ENABLE_EGL_BACKEND
+    OUTPUT_BACKEND_EGL,
+#endif
+};
+
+static enum output_backend output_backend = OUTPUT_BACKEND_VULKAN;
+
+#ifdef SPOUT2PW_ENABLE_EGL_BACKEND
+static Display *xdisplay = NULL;
+static EGLDisplay egl_display = EGL_NO_DISPLAY;
+static EGLContext egl_context = EGL_NO_CONTEXT;
+static EGLSurface egl_surface = EGL_NO_SURFACE;
+
+static NTSTATUS create_source_egl(struct create_source_params *params);
+#endif
+
 struct source {
     void *receiver;
     struct funnel_stream *stream;
     VkCommandBuffer commandBuffer;
     VkDeviceMemory mem;
     VkImage image;
+#ifdef SPOUT2PW_ENABLE_EGL_BACKEND
+    GLuint gl_source_memory;
+    GLuint gl_source_texture;
+    GLuint gl_source_fbo;
+#endif
 
     pthread_mutex_t lock;
     pthread_cond_t cond;
@@ -261,6 +305,188 @@ static bool getflag(const char *name) {
     return !strcmp(val, "1");
 }
 
+static struct funnel_fraction get_default_stream_rate(void) {
+    const char *raw = getenv("SPOUT2PW_FPS");
+    char *end = NULL;
+    unsigned long fps;
+
+    if (!raw || !raw[0])
+        return FUNNEL_FRACTION(60, 1);
+
+    errno = 0;
+    fps = strtoul(raw, &end, 10);
+    if (errno || !end || *end || fps == 0 || fps > 240) {
+        WARN("Invalid SPOUT2PW_FPS=%s, defaulting to 60\n", raw);
+        return FUNNEL_FRACTION(60, 1);
+    }
+
+    return FUNNEL_FRACTION((uint32_t)fps, 1);
+}
+
+static bool want_egl_output_backend(void) {
+#ifdef SPOUT2PW_ENABLE_EGL_BACKEND
+    const char *raw = getenv("SPOUT2PW_OUTPUT_BACKEND");
+    if (!raw || !raw[0])
+        return false;
+    return !strcmp(raw, "egl");
+#else
+    const char *raw = getenv("SPOUT2PW_OUTPUT_BACKEND");
+    if (raw && raw[0] && !strcmp(raw, "egl"))
+        WARN("SPOUT2PW_OUTPUT_BACKEND=egl ignored because EGL backend is not compiled in\n");
+    return false;
+#endif
+}
+
+static int startup_funnel(void) {
+    int ret = funnel_new(&funnel);
+    if (ret) {
+        ERR("libfunnel initialization failed: %d\n", ret);
+        return ret;
+    }
+
+    const char *appname = getenv("SPOUT2PW_APPNAME");
+    if (appname && appname[0]) {
+        funnel_set_app_name(funnel, appname);
+
+        char *appid;
+        assert(asprintf(&appid, "yt.lina.spout2pw.%s", appname));
+        funnel_set_app_id(funnel, appid);
+        free(appid);
+    } else {
+        ret = funnel_set_app_name(funnel, "Spout2PW");
+        assert(ret == 0);
+
+        ret = funnel_set_app_id(funnel, "yt.lina.spout2pw");
+        assert(ret == 0);
+    }
+
+    ret = funnel_connect(funnel);
+    if (ret)
+        return ret;
+
+    return 0;
+}
+
+#ifdef SPOUT2PW_ENABLE_EGL_BACKEND
+static NTSTATUS startup_egl_backend(struct startup_params *params) {
+    static const EGLint config_attrs[] = {
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_RED_SIZE,     8,              EGL_GREEN_SIZE,      8,
+        EGL_BLUE_SIZE,    8,              EGL_ALPHA_SIZE,      8,
+        EGL_NONE,
+    };
+    static const EGLint pbuffer_attrs[] = {
+        EGL_WIDTH,
+        1,
+        EGL_HEIGHT,
+        1,
+        EGL_NONE,
+    };
+
+    if (!XInitThreads()) {
+        ERROR_MSG("XInitThreads failed");
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    xdisplay = XOpenDisplay(NULL);
+    if (!xdisplay) {
+        ERROR_MSG("Failed to open X11 display");
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    egl_display = eglGetDisplay((EGLNativeDisplayType)xdisplay);
+    if (egl_display == EGL_NO_DISPLAY) {
+        ERROR_MSG("Failed to get EGL display");
+        goto fail;
+    }
+
+    EGLint major = 0;
+    EGLint minor = 0;
+    if (!eglInitialize(egl_display, &major, &minor)) {
+        ERROR_MSG("eglInitialize failed: 0x%x", eglGetError());
+        goto fail;
+    }
+
+    if (!eglBindAPI(EGL_OPENGL_API)) {
+        ERROR_MSG("eglBindAPI(EGL_OPENGL_API) failed: 0x%x", eglGetError());
+        goto fail;
+    }
+
+    EGLConfig config = NULL;
+    EGLint count = 0;
+    if (!eglChooseConfig(egl_display, config_attrs, &config, 1, &count) ||
+        count < 1) {
+        ERROR_MSG("eglChooseConfig failed: 0x%x", eglGetError());
+        goto fail;
+    }
+
+    egl_surface = eglCreatePbufferSurface(egl_display, config, pbuffer_attrs);
+    if (egl_surface == EGL_NO_SURFACE) {
+        ERROR_MSG("eglCreatePbufferSurface failed: 0x%x", eglGetError());
+        goto fail;
+    }
+
+    egl_context = eglCreateContext(egl_display, config, EGL_NO_CONTEXT, NULL);
+    if (egl_context == EGL_NO_CONTEXT) {
+        ERROR_MSG("eglCreateContext failed: 0x%x", eglGetError());
+        goto fail;
+    }
+
+    if (!eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context)) {
+        ERROR_MSG("eglMakeCurrent failed: 0x%x", eglGetError());
+        goto fail;
+    }
+
+    glewExperimental = GL_TRUE;
+    (void)glewInit();
+    glGetError();
+
+    if (!GLEW_OES_EGL_image || !GLEW_EXT_memory_object_fd) {
+        ERROR_MSG("Missing required OpenGL external object extensions");
+        goto fail;
+    }
+
+    if (!eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        EGL_NO_CONTEXT)) {
+        ERROR_MSG("Failed to release EGL context from startup thread: 0x%x",
+                  eglGetError());
+        goto fail;
+    }
+
+    int ret = startup_funnel();
+    if (ret) {
+        if (ret == -ECONNREFUSED) {
+            ERROR_MSG("Failed to connect to PipeWire");
+            return STATUS_PORT_CONNECTION_REFUSED;
+        }
+        ERROR_MSG("PipeWire initialization failed: %d", ret);
+        return errno_to_status(-ret);
+    }
+
+    output_backend = OUTPUT_BACKEND_EGL;
+    return STATUS_SUCCESS;
+
+fail:
+    if (egl_context != EGL_NO_CONTEXT) {
+        eglDestroyContext(egl_display, egl_context);
+        egl_context = EGL_NO_CONTEXT;
+    }
+    if (egl_surface != EGL_NO_SURFACE) {
+        eglDestroySurface(egl_display, egl_surface);
+        egl_surface = EGL_NO_SURFACE;
+    }
+    if (egl_display != EGL_NO_DISPLAY) {
+        eglTerminate(egl_display);
+        egl_display = EGL_NO_DISPLAY;
+    }
+    if (xdisplay) {
+        XCloseDisplay(xdisplay);
+        xdisplay = NULL;
+    }
+    return STATUS_UNSUCCESSFUL;
+}
+#endif
+
 static NTSTATUS startup(void *args) {
     struct startup_params *params = args;
 
@@ -269,6 +495,11 @@ static NTSTATUS startup(void *args) {
     VkResult result;
 
     pthread_mutex_init(&vk_lock, NULL);
+
+#ifdef SPOUT2PW_ENABLE_EGL_BACKEND
+    if (want_egl_output_backend())
+        return startup_egl_backend(params);
+#endif
 
     {
         VkApplicationInfo appInfo = {0};
@@ -555,29 +786,7 @@ static NTSTATUS startup(void *args) {
         }
     }
 
-    int ret = funnel_new(&funnel);
-    if (ret) {
-        ERROR_MSG("libfunnel initialization failed: %d", ret);
-        return errno_to_status(-ret);
-    }
-
-    const char *appname = getenv("SPOUT2PW_APPNAME");
-    if (appname && appname[0]) {
-        funnel_set_app_name(funnel, appname);
-
-        char *appid;
-        assert(asprintf(&appid, "yt.lina.spout2pw.%s", appname));
-        funnel_set_app_id(funnel, appid);
-        free(appid);
-    } else {
-        ret = funnel_set_app_name(funnel, "Spout2PW");
-        assert(ret == 0);
-
-        ret = funnel_set_app_id(funnel, "yt.lina.spout2pw");
-        assert(ret == 0);
-    }
-
-    ret = funnel_connect(funnel);
+    int ret = startup_funnel();
     if (ret) {
         if (ret == -ECONNREFUSED) {
             ERROR_MSG("Failed to connect to PipeWire");
@@ -587,14 +796,21 @@ static NTSTATUS startup(void *args) {
         return errno_to_status(-ret);
     }
 
+    output_backend = OUTPUT_BACKEND_VULKAN;
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS create_source(void *args) {
+    struct create_source_params *params = args;
+
+#ifdef SPOUT2PW_ENABLE_EGL_BACKEND
+    if (output_backend == OUTPUT_BACKEND_EGL)
+        return create_source_egl(params);
+#endif
+
     VkResult result;
     int ret = -EINVAL;
 
-    struct create_source_params *params = args;
     struct source *source;
     struct funnel_stream *stream;
 
@@ -637,9 +853,9 @@ static NTSTATUS create_source(void *args) {
     if (ret)
         goto free_stream;
 
-    ret =
-        funnel_stream_set_rate(stream, FUNNEL_RATE_VARIABLE,
-                               FUNNEL_FRACTION(1, 1), FUNNEL_FRACTION(1000, 1));
+    struct funnel_fraction default_rate = get_default_stream_rate();
+    ret = funnel_stream_set_rate(stream, default_rate, default_rate,
+                                 default_rate);
     if (ret)
         goto free_stream;
 
@@ -758,6 +974,195 @@ static struct format_alpha dx_to_vkformat(uint32_t format) {
         return (struct format_alpha){VK_FORMAT_UNDEFINED, false};
     }
 }
+
+#ifdef SPOUT2PW_ENABLE_EGL_BACKEND
+static GLenum dx_to_gl_internal_format(uint32_t format) {
+    switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        return GL_RGBA32F;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return GL_RGBA16F;
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_SNORM:
+        return GL_RGBA16;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return GL_RGB10_A2;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_SNORM:
+        return GL_RGBA8;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case D3DFMT_A8R8G8B8:
+    case D3DFMT_X8R8G8B8:
+        return GL_BGRA8_EXT;
+    default:
+        ERR("Unsupported DX format %d for OpenGL import\n", format);
+        return 0;
+    }
+}
+
+static int make_egl_context_current(void) {
+    if (!eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context)) {
+        ERR("eglMakeCurrent failed: 0x%x\n", eglGetError());
+        return -EIO;
+    }
+    return 0;
+}
+
+static void release_egl_context(void) {
+    if (egl_display != EGL_NO_DISPLAY)
+        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                       EGL_NO_CONTEXT);
+}
+
+static void free_texture_egl(struct source *source) {
+    TRACE("Freeing EGL/OpenGL texture\n");
+
+    if (source->gl_source_fbo) {
+        glDeleteFramebuffers(1, &source->gl_source_fbo);
+        source->gl_source_fbo = 0;
+    }
+    if (source->gl_source_texture) {
+        glDeleteTextures(1, &source->gl_source_texture);
+        source->gl_source_texture = 0;
+    }
+    if (source->gl_source_memory) {
+        glDeleteMemoryObjectsEXT(1, &source->gl_source_memory);
+        source->gl_source_memory = 0;
+    }
+    if (source->cur_fd != -1) {
+        close(source->cur_fd);
+        source->cur_fd = -1;
+    }
+}
+
+static int import_texture_egl(struct source *source) {
+    if (source->info.opaque_fd < 0 || !source->info.resource_size)
+        return -EINVAL;
+
+    int fd = fcntl(source->info.opaque_fd, F_DUPFD_CLOEXEC, 3);
+    if (fd < 0)
+        return -EINVAL;
+
+    source->cur_fd = source->info.opaque_fd;
+    source->info.opaque_fd = -1;
+
+    GLenum internal_format = dx_to_gl_internal_format(source->info.format);
+    if (!internal_format) {
+        close(fd);
+        source->cur_fd = -1;
+        return -EINVAL;
+    }
+
+    const GLint dedicated = GL_TRUE;
+    glCreateMemoryObjectsEXT(1, &source->gl_source_memory);
+    if (!source->gl_source_memory) {
+        close(fd);
+        source->cur_fd = -1;
+        return -EIO;
+    }
+    glMemoryObjectParameterivEXT(source->gl_source_memory,
+                                 GL_DEDICATED_MEMORY_OBJECT_EXT, &dedicated);
+    glImportMemoryFdEXT(source->gl_source_memory, source->info.resource_size,
+                        GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd);
+
+    glGenTextures(1, &source->gl_source_texture);
+    glBindTexture(GL_TEXTURE_2D, source->gl_source_texture);
+    glTextureStorageMem2DEXT(source->gl_source_texture, 1, internal_format,
+                             source->info.width, source->info.height,
+                             source->gl_source_memory, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    glGenFramebuffers(1, &source->gl_source_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, source->gl_source_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           source->gl_source_texture, 0);
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        ERR("OpenGL source framebuffer incomplete: 0x%x\n", status);
+        free_texture_egl(source);
+        return -EIO;
+    }
+
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        ERR("OpenGL source texture import failed: 0x%x\n", err);
+        free_texture_egl(source);
+        return -EIO;
+    }
+
+    TRACE("OpenGL source texture import OK\n");
+    return 0;
+}
+
+static NTSTATUS create_source_egl(struct create_source_params *params) {
+    int ret = -EINVAL;
+    struct source *source = calloc(1, sizeof(*source));
+    struct funnel_stream *stream = NULL;
+
+    ret = funnel_stream_create(funnel, params->sender_name, &stream);
+    if (ret) {
+        ERROR_MSG("Failed to create PipeWire stream");
+        goto fail;
+    }
+
+    ret = funnel_stream_init_egl(stream, egl_display);
+    if (ret) {
+        ERROR_MSG("Failed to set up EGL for stream");
+        goto fail_stream;
+    }
+
+    const char *instance_name = getenv("SPOUT2PW_INSTANCE");
+    if (instance_name && instance_name[0])
+        funnel_stream_set_instance(stream, instance_name, true);
+
+    ret = funnel_stream_set_mode(stream, FUNNEL_SYNCHRONOUS);
+    if (ret)
+        goto fail_stream;
+
+    struct funnel_fraction default_rate = get_default_stream_rate();
+    ret = funnel_stream_set_rate(stream, default_rate, default_rate,
+                                 default_rate);
+    if (ret)
+        goto fail_stream;
+
+    ret = funnel_stream_set_sync(stream, FUNNEL_SYNC_BOTH, FUNNEL_SYNC_BOTH);
+    if (ret)
+        goto fail_stream;
+
+    bool have_format = false;
+    ret = funnel_stream_egl_add_format(stream, FUNNEL_EGL_FORMAT_RGBA8888);
+    have_format |= ret == 0;
+    ret = funnel_stream_egl_add_format(stream, FUNNEL_EGL_FORMAT_RGB888);
+    have_format |= ret == 0;
+
+    if (!have_format) {
+        ERR("No EGL formats compatible\n");
+        ret = -EINVAL;
+        goto fail_stream;
+    }
+
+    pthread_mutex_init(&source->lock, NULL);
+    pthread_cond_init(&source->cond, NULL);
+    source->stream = stream;
+    source->update = true;
+    source->info = params->info;
+    source->receiver = params->receiver;
+    source->cur_fd = -1;
+    params->ret_source = source;
+    return STATUS_SUCCESS;
+
+fail_stream:
+    if (stream)
+        funnel_stream_destroy(stream);
+fail:
+    free(source);
+    return errno_to_status(-ret);
+}
+
+#endif
 
 static int import_texture(struct source *source) {
     VkResult result;
@@ -891,7 +1296,201 @@ err_close:
     return -EINVAL;
 }
 
+#ifdef SPOUT2PW_ENABLE_EGL_BACKEND
+static NTSTATUS run_source_egl(void *args) {
+    struct source *source = args;
+    bool active = false;
+    int ret;
+
+    TRACE("run_source_egl()\n");
+
+    if ((ret = make_egl_context_current()) < 0) {
+        source->dead = true;
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    pthread_mutex_lock(&source->lock);
+    while (!source->quit) {
+        if (source->update) {
+            source->update = false;
+            if (source->info.flags &
+                (RECEIVER_DISCONNECTED | RECEIVER_TEXTURE_INVALID)) {
+                active = false;
+            } else if (source->info.flags & RECEIVER_TEXTURE_UPDATED) {
+                free_texture_egl(source);
+                if (import_texture_egl(source) == 0) {
+                    ret = funnel_stream_set_size(source->stream,
+                                                 source->info.width,
+                                                 source->info.height);
+                    if (ret) {
+                        ERR("Failed to set size\n");
+                        continue;
+                    }
+                    ret = funnel_stream_configure(source->stream);
+                    if (ret) {
+                        ERR("Failed to configure stream\n");
+                        continue;
+                    }
+                    ret = funnel_stream_start(source->stream);
+                    if (ret) {
+                        ERR("Failed to start stream\n");
+                        continue;
+                    }
+                    source->width = source->info.width;
+                    source->height = source->info.height;
+                    active = true;
+                } else {
+                    ERR("OpenGL texture import failed, stopping stream\n");
+                    active = false;
+                }
+            }
+        }
+        if (!active) {
+            funnel_stream_stop(source->stream);
+            free_texture_egl(source);
+            pthread_cond_wait(&source->cond, &source->lock);
+            continue;
+        }
+
+        pthread_mutex_unlock(&source->lock);
+
+        struct funnel_buffer *buf = NULL;
+        ret = funnel_stream_dequeue(source->stream, &buf);
+        if (ret < 0) {
+            ERR("Buffer dequeue failed: %d\n", ret);
+            goto relock;
+        }
+        if (ret == 0)
+            goto relock;
+
+        uint32_t bwidth, bheight;
+        funnel_buffer_get_size(buf, &bwidth, &bheight);
+        if (bwidth != source->width || bheight != source->height) {
+            funnel_stream_return(source->stream, buf);
+            goto relock;
+        }
+
+        EGLSync acquire = EGL_NO_SYNC;
+        if (funnel_buffer_has_sync(buf)) {
+            ret = funnel_buffer_get_acquire_egl_sync(buf, &acquire);
+            if (ret) {
+                ERR("Failed to get acquire EGL sync: %d\n", ret);
+                funnel_stream_return(source->stream, buf);
+                goto relock;
+            }
+            eglWaitSync(egl_display, acquire, 0);
+            eglDestroySync(egl_display, acquire);
+        }
+
+        EGLImage image = EGL_NO_IMAGE;
+        ret = funnel_buffer_get_egl_image(buf, &image);
+        if (ret || image == EGL_NO_IMAGE) {
+            ERR("Failed to get EGL image for PipeWire buffer: %d\n", ret);
+            funnel_stream_return(source->stream, buf);
+            goto relock;
+        }
+
+        GLuint dst_texture = 0;
+        GLuint dst_fbo = 0;
+        glGenTextures(1, &dst_texture);
+        glBindTexture(GL_TEXTURE_2D, dst_texture);
+        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        glGenFramebuffers(1, &dst_fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst_fbo);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, dst_texture, 0);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, source->gl_source_fbo);
+
+        GLenum status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            ERR("Destination framebuffer incomplete: 0x%x\n", status);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glDeleteFramebuffers(1, &dst_fbo);
+            glDeleteTextures(1, &dst_texture);
+            funnel_stream_return(source->stream, buf);
+            goto relock;
+        }
+
+        struct lock_texture_return *ltex = lock_texture(source->receiver);
+        if (!ltex) {
+            ERR("Failed to lock texture\n");
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glDeleteFramebuffers(1, &dst_fbo);
+            glDeleteTextures(1, &dst_texture);
+            funnel_stream_return(source->stream, buf);
+            goto relock;
+        }
+
+        glBlitFramebuffer(0, 0, bwidth, bheight, 0, 0, bwidth, bheight,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+        if (funnel_buffer_has_sync(buf)) {
+            EGLSync release =
+                eglCreateSync(egl_display, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
+            if (release != EGL_NO_SYNC) {
+                ret = funnel_buffer_set_release_egl_sync(buf, release);
+                eglDestroySync(egl_display, release);
+                if (ret) {
+                    ERR("Failed to set release EGL sync: %d\n", ret);
+                    unlock_texture(source->receiver);
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    glDeleteFramebuffers(1, &dst_fbo);
+                    glDeleteTextures(1, &dst_texture);
+                    funnel_stream_return(source->stream, buf);
+                    goto relock;
+                }
+            }
+        }
+
+        glFlush();
+
+        ret = funnel_stream_enqueue(source->stream, buf);
+        if (ret < 0) {
+            ERR("Enqueue failed: %d\n", ret);
+            funnel_stream_return(source->stream, buf);
+        }
+
+        unlock_texture(source->receiver);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteFramebuffers(1, &dst_fbo);
+        glDeleteTextures(1, &dst_texture);
+
+    relock:
+        pthread_mutex_lock(&source->lock);
+    }
+
+    funnel_stream_stop(source->stream);
+    funnel_stream_destroy(source->stream);
+    free_texture_egl(source);
+
+    if (source->info.opaque_fd != -1) {
+        close(source->info.opaque_fd);
+        source->info.opaque_fd = -1;
+    }
+
+    release_egl_context();
+
+    source->dead = true;
+    while (!source->quit)
+        pthread_cond_wait(&source->cond, &source->lock);
+
+    pthread_mutex_unlock(&source->lock);
+    pthread_cond_destroy(&source->cond);
+    pthread_mutex_destroy(&source->lock);
+    free(source);
+
+    return STATUS_SUCCESS;
+}
+#endif
+
 static NTSTATUS run_source(void *args) {
+#ifdef SPOUT2PW_ENABLE_EGL_BACKEND
+    if (output_backend == OUTPUT_BACKEND_EGL)
+        return run_source_egl(args);
+#endif
+
     VkResult result = VK_SUCCESS;
 
     struct source *source = args;
@@ -1208,13 +1807,35 @@ static NTSTATUS destroy_source(void *args) {
 static void teardown(void) {
     funnel_shutdown(funnel);
 
-    vkDestroyCommandPool(device, commandPool, NULL);
-    vkDestroyDevice(device, NULL);
-    GET_EXTENSION_FUNCTION(vkDestroyDebugUtilsMessengerEXT)(
-        instance, debugMessenger, NULL);
-    vkDestroyInstance(instance, NULL);
+#ifdef SPOUT2PW_ENABLE_EGL_BACKEND
+    if (output_backend == OUTPUT_BACKEND_EGL) {
+        if (egl_context != EGL_NO_CONTEXT) {
+            eglDestroyContext(egl_display, egl_context);
+            egl_context = EGL_NO_CONTEXT;
+        }
+        if (egl_surface != EGL_NO_SURFACE) {
+            eglDestroySurface(egl_display, egl_surface);
+            egl_surface = EGL_NO_SURFACE;
+        }
+        if (egl_display != EGL_NO_DISPLAY) {
+            eglTerminate(egl_display);
+            egl_display = EGL_NO_DISPLAY;
+        }
+        if (xdisplay) {
+            XCloseDisplay(xdisplay);
+            xdisplay = NULL;
+        }
+    } else
+#endif
+    {
+        vkDestroyCommandPool(device, commandPool, NULL);
+        vkDestroyDevice(device, NULL);
+        GET_EXTENSION_FUNCTION(vkDestroyDebugUtilsMessengerEXT)(
+            instance, debugMessenger, NULL);
+        vkDestroyInstance(instance, NULL);
 
-    pthread_mutex_destroy(&vk_lock);
+        pthread_mutex_destroy(&vk_lock);
+    }
 
     WINE_TRACE("Teardown finished\n");
 }
@@ -1238,3 +1859,12 @@ const unixlib_entry_t __wine_unix_call_funcs[] = {
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count);
+
+#ifdef _WIN64
+const unixlib_entry_t __wine_unix_call_wow64_funcs[] = {
+    _getenv,    startup,       _teardown,      create_source,
+    run_source, update_source, destroy_source,
+};
+
+C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count);
+#endif
