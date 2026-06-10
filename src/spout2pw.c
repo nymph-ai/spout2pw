@@ -27,6 +27,7 @@ static WCHAR spout2pwW[] = L"Spout2Pw";
 static HANDLE exit_event;
 static SERVICE_STATUS_HANDLE service_handle;
 static SERVICE_STATUS service_status;
+static bool standalone_mode = false;
 
 static HANDLE sendernames_thread_handle = 0;
 static SPOUTDXTOC_SENDERNAMES *spout_names = NULL;
@@ -594,6 +595,11 @@ static DWORD WINAPI service_handler(DWORD ctrl, DWORD event_type,
     }
 }
 
+static void set_service_status_if_needed(void) {
+    if (!standalone_mode && service_handle)
+        SetServiceStatus(service_handle, &service_status);
+}
+
 // Future use
 __attribute__((unused)) static const char *_getenv(const char *var) {
     NTSTATUS ret;
@@ -612,10 +618,12 @@ static void WINAPI ServiceMain(DWORD argc, LPWSTR *argv) {
     NTSTATUS ret;
     const char *msg = NULL;
 
-    service_handle =
-        RegisterServiceCtrlHandlerExW(spout2pwW, service_handler, NULL);
-    if (!service_handle)
-        return;
+    if (!standalone_mode) {
+        service_handle =
+            RegisterServiceCtrlHandlerExW(spout2pwW, service_handler, NULL);
+        if (!service_handle)
+            return;
+    }
 
     service_status.dwServiceType = SERVICE_WIN32;
     service_status.dwCurrentState = SERVICE_START_PENDING;
@@ -624,7 +632,7 @@ static void WINAPI ServiceMain(DWORD argc, LPWSTR *argv) {
     service_status.dwServiceSpecificExitCode = 0;
     service_status.dwCheckPoint = 1;
     service_status.dwWaitHint = 15000;
-    SetServiceStatus(service_handle, &service_status);
+    set_service_status_if_needed();
 
     TRACE("Loading unix calls\n");
 
@@ -673,7 +681,7 @@ restart:
         SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
     service_status.dwCheckPoint = 0;
     service_status.dwWaitHint = 0;
-    SetServiceStatus(service_handle, &service_status);
+    set_service_status_if_needed();
 
     TRACE("Waiting for exit event\n");
     WaitForMultipleObjects(1, &exit_event, FALSE, INFINITE);
@@ -706,7 +714,7 @@ stop:
     service_status.dwControlsAccepted = 0;
     service_status.dwCheckPoint = 0;
     service_status.dwWaitHint = 0;
-    SetServiceStatus(service_handle, &service_status);
+    set_service_status_if_needed();
 
     TRACE("Service stopped\n");
 }
@@ -738,6 +746,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     if (!found) {
         ERR("Spout2 not configured in WINEDLLPATH\n");
+        return 0;
+    }
+
+    const char *standalone = getenv("SPOUT2PW_STANDALONE");
+    if (standalone && standalone[0] && strcmp(standalone, "0")) {
+        TRACE("Starting standalone bridge\n");
+        standalone_mode = true;
+        ServiceMain(0, NULL);
+        TRACE("Standalone bridge returning\n");
         return 0;
     }
 
