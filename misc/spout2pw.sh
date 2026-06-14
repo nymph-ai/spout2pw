@@ -460,6 +460,33 @@ prepare_prefix() {
 
 }
 
+write_runtime_config() {
+    runtime_config="$cdrive/spout2pw-runtime.env"
+    log "Writing Spout2PW runtime config to $runtime_config"
+
+    write_runtime_env() {
+        local name="$1"
+        local value="${!name-}"
+
+        [ -n "$value" ] || return 0
+        printf '%s=%s\n' "$name" "$value"
+    }
+
+    {
+        write_runtime_env SPOUT2PW_APPNAME
+        write_runtime_env SPOUT2PW_INSTANCE
+        write_runtime_env SPOUT2PW_OUTPUT_BACKEND
+        write_runtime_env SPOUT2PW_FPS
+        write_runtime_env SPOUT2PW_STANDALONE
+        write_runtime_env SPOUT2PW_NODE_PREFIX
+        write_runtime_env SPOUT2PW_SENDER_NAME
+        write_runtime_env PIPEWIRE_CONTRACT_EXPECTED_SENDER_NAME
+        if [ "${quiet:-0}" = 1 ]; then
+            printf '%s\n' "SPOUT2PW_NO_ERROR_DIALOG=1"
+        fi
+    } > "$runtime_config"
+}
+
 prepare_proton() {
     if ! grep -q 'WINEDLLPATH.*in os.environ' "$protonpath/proton"; then
         fatal "This Proton version is too old to work with Spout2PW.\n\nSpout2PW requires a recent Proton 10."
@@ -589,6 +616,7 @@ main() {
     validate_paths
     prepare_proton
     setup_env
+    write_runtime_config
     prepare_prefix
 
     wrap_steam_runtime_command "$@"
