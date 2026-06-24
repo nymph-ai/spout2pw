@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 
@@ -35,6 +36,74 @@ static SPOUTDXTOC_SENDERNAMES *spout_names = NULL;
 static DWORD WINAPI sendernames_thread(void *arg);
 
 static bool do_restart = false;
+
+static bool runtime_config_value(const char *name, char *value,
+                                 size_t value_size) {
+    FILE *file = fopen("C:\\spout2pw-runtime.env", "r");
+    char line[512];
+
+    if (!file)
+        return false;
+
+    while (fgets(line, sizeof(line), file)) {
+        char *eq = strchr(line, '=');
+        char *raw;
+        size_t len;
+
+        if (!eq)
+            continue;
+        *eq = 0;
+        if (strcmp(line, name))
+            continue;
+
+        raw = eq + 1;
+        len = strlen(raw);
+        while (len > 0 &&
+               (raw[len - 1] == '\r' || raw[len - 1] == '\n')) {
+            raw[--len] = 0;
+        }
+
+        if (value_size > 0)
+            snprintf(value, value_size, "%s", raw);
+        fclose(file);
+        return true;
+    }
+
+    fclose(file);
+    return false;
+}
+
+static bool truthy_value(const char *value) {
+    return value && value[0] && strcmp(value, "0") && strcmp(value, "false") &&
+           strcmp(value, "FALSE") && strcmp(value, "no") &&
+           strcmp(value, "NO");
+}
+
+static bool runtime_flag_enabled(const char *name) {
+    char value[64];
+    DWORD required = GetEnvironmentVariableA(name, NULL, 0);
+
+    if (required > 1) {
+        char *env_value = calloc(required, sizeof(char));
+        bool enabled = false;
+
+        if (env_value &&
+            GetEnvironmentVariableA(name, env_value, required) == required - 1)
+            enabled = truthy_value(env_value);
+        free(env_value);
+        return enabled;
+    }
+
+    {
+        const char *env_value = getenv(name);
+        if (env_value && env_value[0])
+            return truthy_value(env_value);
+    }
+
+    if (!runtime_config_value(name, value, sizeof(value)))
+        return false;
+    return truthy_value(value);
+}
 
 #define IOCTL_SHARED_GPU_RESOURCE_GET_UNIX_RESOURCE                            \
     CTL_CODE(FILE_DEVICE_VIDEO, 3, METHOD_BUFFERED, FILE_READ_ACCESS)
@@ -131,6 +200,12 @@ void show_error(HRESULT res, const char *msg) {
     SetServiceStatus(service_handle, &service_status);
 
     TRACE("Show error message box\n");
+
+    if (runtime_flag_enabled("SPOUT2PW_NO_ERROR_DIALOG")) {
+        TRACE("Error dialog suppressed by runtime config\n");
+        free(dialog_msg);
+        return;
+    }
 
     // Hack: https://bugs.winehq.org/show_bug.cgi?id=59393
     AllocConsole();
@@ -750,7 +825,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
 
     const char *standalone = getenv("SPOUT2PW_STANDALONE");
-    if (standalone && standalone[0] && strcmp(standalone, "0")) {
+    if ((standalone && standalone[0] && strcmp(standalone, "0")) ||
+        runtime_flag_enabled("SPOUT2PW_STANDALONE")) {
         TRACE("Starting standalone bridge\n");
         standalone_mode = true;
         ServiceMain(0, NULL);

@@ -1,10 +1,13 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -78,6 +81,76 @@ WINE_DEFAULT_DEBUG_CHANNEL(spout2pw);
         ERR("Error: %s\n", error_msg);                                         \
         params->error_msg = error_msg;                                         \
     } while (0)
+
+static bool read_runtime_config_path(const char *path, const char *name,
+                                     char *value, size_t value_size) {
+    FILE *file = fopen(path, "r");
+    char line[512];
+
+    if (!file)
+        return false;
+
+    while (fgets(line, sizeof(line), file)) {
+        char *eq = strchr(line, '=');
+        char *raw;
+        size_t len;
+
+        if (!eq)
+            continue;
+        *eq = 0;
+        if (strcmp(line, name))
+            continue;
+
+        raw = eq + 1;
+        len = strlen(raw);
+        while (len > 0 &&
+               (raw[len - 1] == '\r' || raw[len - 1] == '\n')) {
+            raw[--len] = 0;
+        }
+
+        if (value_size > 0)
+            snprintf(value, value_size, "%s", raw);
+        fclose(file);
+        return true;
+    }
+
+    fclose(file);
+    return false;
+}
+
+static bool read_runtime_config(const char *name, char *value,
+                                size_t value_size) {
+    const char *root = getenv("WINEPREFIX");
+    char path[PATH_MAX];
+
+    if (root && root[0]) {
+        snprintf(path, sizeof(path), "%s%sdrive_c/spout2pw-runtime.env", root,
+                 root[strlen(root) - 1] == '/' ? "" : "/");
+        if (read_runtime_config_path(path, name, value, value_size))
+            return true;
+    }
+
+    root = getenv("STEAM_COMPAT_DATA_PATH");
+    if (root && root[0]) {
+        snprintf(path, sizeof(path), "%s%spfx/drive_c/spout2pw-runtime.env",
+                 root, root[strlen(root) - 1] == '/' ? "" : "/");
+        if (read_runtime_config_path(path, name, value, value_size))
+            return true;
+    }
+
+    return false;
+}
+
+static const char *runtime_setting(const char *name, char *value,
+                                   size_t value_size) {
+    const char *env_value = getenv(name);
+
+    if (env_value && env_value[0])
+        return env_value;
+    if (read_runtime_config(name, value, value_size))
+        return value;
+    return NULL;
+}
 
 #define CHECK_VK_STARTUP(_expr)                                                \
     result = _expr;                                                            \
@@ -306,7 +379,8 @@ static bool getflag(const char *name) {
 }
 
 static struct funnel_fraction get_default_stream_rate(void) {
-    const char *raw = getenv("SPOUT2PW_FPS");
+    char value[64];
+    const char *raw = runtime_setting("SPOUT2PW_FPS", value, sizeof(value));
     char *end = NULL;
     unsigned long fps;
 
@@ -325,12 +399,16 @@ static struct funnel_fraction get_default_stream_rate(void) {
 
 static bool want_egl_output_backend(void) {
 #ifdef SPOUT2PW_ENABLE_EGL_BACKEND
-    const char *raw = getenv("SPOUT2PW_OUTPUT_BACKEND");
+    char value[64];
+    const char *raw =
+        runtime_setting("SPOUT2PW_OUTPUT_BACKEND", value, sizeof(value));
     if (!raw || !raw[0])
         return false;
     return !strcmp(raw, "egl");
 #else
-    const char *raw = getenv("SPOUT2PW_OUTPUT_BACKEND");
+    char value[64];
+    const char *raw =
+        runtime_setting("SPOUT2PW_OUTPUT_BACKEND", value, sizeof(value));
     if (raw && raw[0] && !strcmp(raw, "egl"))
         WARN("SPOUT2PW_OUTPUT_BACKEND=egl ignored because EGL backend is not compiled in\n");
     return false;
@@ -344,7 +422,9 @@ static int startup_funnel(void) {
         return ret;
     }
 
-    const char *appname = getenv("SPOUT2PW_APPNAME");
+    char appname_value[128];
+    const char *appname =
+        runtime_setting("SPOUT2PW_APPNAME", appname_value, sizeof(appname_value));
     if (appname && appname[0]) {
         funnel_set_app_name(funnel, appname);
 
@@ -844,7 +924,9 @@ static NTSTATUS create_source(void *args) {
         goto free_stream;
     }
 
-    const char *instance_name = getenv("SPOUT2PW_INSTANCE");
+    char instance_value[128];
+    const char *instance_name = runtime_setting(
+        "SPOUT2PW_INSTANCE", instance_value, sizeof(instance_value));
     if (instance_name && instance_name[0]) {
         funnel_stream_set_instance(stream, instance_name, true);
     }
@@ -1114,7 +1196,9 @@ static NTSTATUS create_source_egl(struct create_source_params *params) {
         goto fail_stream;
     }
 
-    const char *instance_name = getenv("SPOUT2PW_INSTANCE");
+    char instance_value[128];
+    const char *instance_name = runtime_setting(
+        "SPOUT2PW_INSTANCE", instance_value, sizeof(instance_value));
     if (instance_name && instance_name[0])
         funnel_stream_set_instance(stream, instance_name, true);
 
