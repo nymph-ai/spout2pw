@@ -2413,6 +2413,10 @@ static NTSTATUS run_source(void *args) {
             funnel_stream_return(source->stream, buf);
             goto cont;
         }
+        ret = funnel_buffer_prime_dmabuf(buf);
+        if (ret < 0)
+            WARN("Failed to prime PipeWire DMA-BUF for external import: %d\n",
+                 ret);
         log_export_probe_stats(&source_probe);
         log_export_probe_stats(&export_probe);
 
