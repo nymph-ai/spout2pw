@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -138,6 +139,15 @@ static bool read_runtime_config(const char *name, char *value,
         if (read_runtime_config_path(path, name, value, value_size))
             return true;
     }
+
+    snprintf(path, sizeof(path), "/tmp/spout2pw-runtime-%u.env",
+             (unsigned)getuid());
+    if (read_runtime_config_path(path, name, value, value_size))
+        return true;
+
+    if (read_runtime_config_path("/tmp/spout2pw-runtime.env", name, value,
+                                 value_size))
+        return true;
 
     return false;
 }
@@ -554,6 +564,22 @@ static bool getflag(const char *name) {
     return !strcmp(val, "1");
 }
 
+static int get_runtime_int(const char *name, int default_value) {
+    char value[64];
+    const char *raw = runtime_setting(name, value, sizeof(value));
+    char *end = NULL;
+    long parsed;
+
+    if (!raw || !raw[0])
+        return default_value;
+
+    errno = 0;
+    parsed = strtol(raw, &end, 10);
+    if (errno || end == raw)
+        return default_value;
+    return (int)parsed;
+}
+
 static struct funnel_fraction get_default_stream_rate(void) {
     char value[64];
     const char *raw = runtime_setting("SPOUT2PW_FPS", value, sizeof(value));
@@ -635,6 +661,282 @@ static bool want_egl_output_backend(void) {
         WARN("SPOUT2PW_OUTPUT_BACKEND=egl ignored because EGL backend is not compiled in\n");
     return false;
 #endif
+}
+
+static bool find_vk_memory_type(uint32_t type_bits, VkMemoryPropertyFlags flags,
+                                uint32_t *index) {
+    VkPhysicalDeviceMemoryProperties properties;
+
+    vkGetPhysicalDeviceMemoryProperties(physDevice, &properties);
+    for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+        if ((type_bits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & flags) == flags) {
+            *index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool export_probe_should_run(void) {
+    static int remaining = -1;
+
+    if (remaining == -1)
+        remaining = get_runtime_int("SPOUT2PW_EXPORT_PROBE_FRAMES", 0);
+    if (remaining <= 0)
+        return false;
+
+    remaining--;
+    return true;
+}
+
+static void export_probe_log(const char *fmt, ...) {
+    va_list args;
+    va_list file_args;
+    FILE *file;
+
+    va_start(args, fmt);
+    va_copy(file_args, args);
+    vfprintf(stderr, fmt, args);
+    fflush(stderr);
+    va_end(args);
+
+    file = fopen("/tmp/spout2pw-exported-image-probe.log", "a");
+    if (file) {
+        vfprintf(file, fmt, file_args);
+        fclose(file);
+    }
+    va_end(file_args);
+}
+
+struct export_probe {
+    bool enabled;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    VkDeviceSize size;
+    VkFormat format;
+    const char *label;
+    bool has_alpha;
+    uint32_t width;
+    uint32_t height;
+};
+
+static void destroy_export_probe(struct export_probe *probe) {
+    if (probe->buffer != VK_NULL_HANDLE)
+        vkDestroyBuffer(device, probe->buffer, NULL);
+    if (probe->memory != VK_NULL_HANDLE)
+        vkFreeMemory(device, probe->memory, NULL);
+    memset(probe, 0, sizeof(*probe));
+}
+
+static bool init_image_probe(VkFormat format, bool has_alpha, uint32_t width,
+                             uint32_t height, const char *label,
+                             struct export_probe *probe) {
+    VkResult result = VK_SUCCESS;
+    VkMemoryRequirements requirements;
+    uint32_t memory_type = 0;
+
+    memset(probe, 0, sizeof(*probe));
+
+    probe->format = format;
+    probe->has_alpha = has_alpha;
+    probe->width = width;
+    probe->height = height;
+    probe->label = label;
+
+    if (probe->format != VK_FORMAT_R8G8B8A8_SRGB &&
+        probe->format != VK_FORMAT_R8G8B8A8_UNORM &&
+        probe->format != VK_FORMAT_B8G8R8A8_SRGB &&
+        probe->format != VK_FORMAT_B8G8R8A8_UNORM) {
+        export_probe_log("Export probe %s: unsupported Vulkan format %d\n",
+                         probe->label, probe->format);
+        return false;
+    }
+
+    probe->size = (VkDeviceSize)probe->width * probe->height * 4;
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = probe->size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    CHECK_VK_RESULT(vkCreateBuffer(device, &buffer_info, NULL, &probe->buffer)) {
+        export_probe_log("Export probe %s: failed to create readback buffer\n",
+                         probe->label);
+        destroy_export_probe(probe);
+        return false;
+    }
+
+    vkGetBufferMemoryRequirements(device, probe->buffer, &requirements);
+    if (!find_vk_memory_type(requirements.memoryTypeBits,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                             &memory_type)) {
+        export_probe_log(
+            "Export probe %s: failed to find host-visible coherent memory\n",
+            probe->label);
+        destroy_export_probe(probe);
+        return false;
+    }
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = requirements.size,
+        .memoryTypeIndex = memory_type,
+    };
+    CHECK_VK_RESULT(vkAllocateMemory(device, &alloc_info, NULL, &probe->memory)) {
+        export_probe_log("Export probe %s: failed to allocate readback memory\n",
+                         probe->label);
+        destroy_export_probe(probe);
+        return false;
+    }
+    CHECK_VK_RESULT(vkBindBufferMemory(device, probe->buffer, probe->memory, 0)) {
+        export_probe_log("Export probe %s: failed to bind readback memory\n",
+                         probe->label);
+        destroy_export_probe(probe);
+        return false;
+    }
+
+    probe->enabled = true;
+    export_probe_log("Export probe enabled for %s VkImage: "
+                     "format=%d alpha=%d size=%ux%u\n",
+                     probe->label, probe->format, probe->has_alpha ? 1 : 0,
+                     probe->width, probe->height);
+    return true;
+}
+
+static bool init_export_probe(struct funnel_buffer *buf,
+                              struct export_probe *probe) {
+    VkFormat format;
+    bool has_alpha;
+    uint32_t width, height;
+
+    memset(probe, 0, sizeof(*probe));
+
+    if (!export_probe_should_run())
+        return false;
+
+    if (funnel_buffer_get_vk_format(buf, &format, &has_alpha)) {
+        export_probe_log(
+            "Export probe: failed to get PipeWire Vulkan buffer format\n");
+        return false;
+    }
+    funnel_buffer_get_size(buf, &width, &height);
+
+    return init_image_probe(format, has_alpha, width, height, "actual queued",
+                            probe);
+}
+
+static void record_export_probe_copy(VkCommandBuffer command_buffer,
+                                     VkImage image, VkImageLayout layout,
+                                     const struct export_probe *probe) {
+    if (!probe->enabled)
+        return;
+
+    VkBufferImageCopy copy = {
+        .bufferOffset = 0,
+        .bufferRowLength = probe->width,
+        .bufferImageHeight = probe->height,
+        .imageSubresource =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {probe->width, probe->height, 1},
+    };
+
+    vkCmdCopyImageToBuffer(command_buffer, image, layout, probe->buffer, 1,
+                           &copy);
+}
+
+static void log_export_probe_stats(const struct export_probe *probe) {
+    void *mapped = NULL;
+    VkResult result = VK_SUCCESS;
+    uint8_t *pixels;
+    uint64_t nonblack = 0;
+    uint64_t alpha_nonzero = 0;
+    uint64_t count = (uint64_t)probe->width * probe->height;
+    double mean = 0.0;
+    double m2 = 0.0;
+    uint8_t first[4] = {0};
+    uint8_t min_rgb[3] = {255, 255, 255};
+    uint8_t max_rgb[3] = {0, 0, 0};
+
+    if (!probe->enabled)
+        return;
+
+    CHECK_VK_RESULT(
+        vkMapMemory(device, probe->memory, 0, probe->size, 0, &mapped)) {
+        export_probe_log("Export probe %s: failed to map readback memory\n",
+                         probe->label);
+        return;
+    }
+
+    pixels = mapped;
+    if (count > 0) {
+        first[0] = pixels[0];
+        first[1] = pixels[1];
+        first[2] = pixels[2];
+        first[3] = pixels[3];
+    }
+
+    for (uint64_t i = 0; i < count; i++) {
+        uint8_t c0 = pixels[i * 4 + 0];
+        uint8_t c1 = pixels[i * 4 + 1];
+        uint8_t c2 = pixels[i * 4 + 2];
+        uint8_t a = pixels[i * 4 + 3];
+        uint8_t r, g, b;
+
+        if (probe->format == VK_FORMAT_B8G8R8A8_SRGB ||
+            probe->format == VK_FORMAT_B8G8R8A8_UNORM) {
+            b = c0;
+            g = c1;
+            r = c2;
+        } else {
+            r = c0;
+            g = c1;
+            b = c2;
+        }
+
+        if (r || g || b)
+            nonblack++;
+        if (a)
+            alpha_nonzero++;
+        if (r < min_rgb[0])
+            min_rgb[0] = r;
+        if (g < min_rgb[1])
+            min_rgb[1] = g;
+        if (b < min_rgb[2])
+            min_rgb[2] = b;
+        if (r > max_rgb[0])
+            max_rgb[0] = r;
+        if (g > max_rgb[1])
+            max_rgb[1] = g;
+        if (b > max_rgb[2])
+            max_rgb[2] = b;
+
+        double y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        double delta = y - mean;
+        mean += delta / (double)(i + 1);
+        m2 += delta * (y - mean);
+    }
+
+    export_probe_log(
+        "Export probe %s VkImage: format=%d alpha=%d size=%ux%u "
+        "first_bytes=[%u,%u,%u,%u] rgb_min=[%u,%u,%u] rgb_max=[%u,%u,%u] "
+        "luma_mean=%.6f luma_variance=%.6f rgb_nonblack_ratio=%.9f "
+        "alpha_nonzero_ratio=%.9f\n",
+        probe->label, probe->format, probe->has_alpha ? 1 : 0, probe->width,
+        probe->height, first[0], first[1], first[2], first[3], min_rgb[0],
+        min_rgb[1], min_rgb[2], max_rgb[0], max_rgb[1], max_rgb[2], mean,
+        count ? m2 / (double)count : 0.0,
+        count ? (double)nonblack / (double)count : 0.0,
+        count ? (double)alpha_nonzero / (double)count : 0.0);
+
+    vkUnmapMemory(device, probe->memory);
 }
 
 static int startup_funnel(void) {
@@ -1253,6 +1555,26 @@ static struct format_alpha dx_to_vkformat(uint32_t format) {
     }
 }
 
+static bool init_source_probe(const struct source *source, bool should_run,
+                              struct export_probe *probe) {
+    memset(probe, 0, sizeof(*probe));
+
+    if (!should_run)
+        return false;
+
+    struct format_alpha fmt_alpha = dx_to_vkformat(source->info.format);
+    if (fmt_alpha.format == VK_FORMAT_UNDEFINED) {
+        export_probe_log("Export probe imported Spout source: unsupported DX "
+                         "format %u\n",
+                         source->info.format);
+        return false;
+    }
+
+    return init_image_probe(fmt_alpha.format, fmt_alpha.alpha,
+                            source->info.width, source->info.height,
+                            "imported Spout source", probe);
+}
+
 #ifdef SPOUT2PW_ENABLE_EGL_BACKEND
 static GLenum dx_to_gl_internal_format(uint32_t format) {
     switch (format) {
@@ -1838,6 +2160,9 @@ static NTSTATUS run_source(void *args) {
         }
         pthread_mutex_unlock(&source->lock);
 
+        struct export_probe export_probe = {0};
+        struct export_probe source_probe = {0};
+
         TRACE("run_source(): Dequeuing\n");
 
         struct funnel_buffer *buf = NULL;
@@ -1884,6 +2209,9 @@ static NTSTATUS run_source(void *args) {
         }
         assert(image);
 
+        init_export_probe(buf, &export_probe);
+        init_source_probe(source, export_probe.enabled, &source_probe);
+
         VkCommandBufferBeginInfo beginInfo = {0};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -1897,11 +2225,12 @@ static NTSTATUS run_source(void *args) {
 
         /*
          * See: https://github.com/KhronosGroup/Vulkan-Docs/issues/2652
-         * GENERAL -> GENERAL layout transition is correct for external source
-         * images. The PipeWire destination image still needs an explicit
-         * external ownership acquire plus a transfer layout before the blit,
-         * otherwise NVIDIA can expose a successfully-imported but still-zero
-         * DMA-BUF to GL consumers.
+         * GENERAL -> GENERAL layout transition is correct for the imported
+         * Spout source image, but do not transfer queue-family ownership for
+         * that source. The D3D producer never performs a matching Vulkan
+         * release, and NVIDIA can either return zeros or stall the submit if we
+         * treat the source like a PipeWire DMA-BUF. The PipeWire destination
+         * image still needs explicit external acquire/release around the blit.
          */
         VkImageMemoryBarrier source_acquire_barrier = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -1911,8 +2240,8 @@ static NTSTATUS run_source(void *args) {
             .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                              VK_ACCESS_TRANSFER_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
-            .dstQueueFamilyIndex = queueFamilyIndex,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = source->image,
             .subresourceRange =
                 {
@@ -1951,6 +2280,9 @@ static NTSTATUS run_source(void *args) {
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
                              NULL, 2, pre_blit_barriers);
 
+        record_export_probe_copy(source->commandBuffer, source->image,
+                                 VK_IMAGE_LAYOUT_GENERAL, &source_probe);
+
         VkImageBlit region = {
             .srcSubresource =
                 {
@@ -1976,29 +2308,43 @@ static NTSTATUS run_source(void *args) {
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
                        VK_FILTER_NEAREST);
 
-        VkImageMemoryBarrier source_release_barrier = {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-            .dstAccessMask = 0,
-            .srcQueueFamilyIndex = queueFamilyIndex,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
-            .image = source->image,
-            .subresourceRange =
-                {
-                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .baseMipLevel = 0,
-                    .levelCount = 1,
-                    .baseArrayLayer = 0,
-                    .layerCount = 1,
-                },
-        };
+        if (export_probe.enabled) {
+            VkImageMemoryBarrier dst_probe_barrier = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = image,
+                .subresourceRange =
+                    {
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .baseMipLevel = 0,
+                        .levelCount = 1,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+            };
+
+            vkCmdPipelineBarrier(source->commandBuffer,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+                                 NULL, 1, &dst_probe_barrier);
+            record_export_probe_copy(source->commandBuffer, image,
+                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                     &export_probe);
+        }
+
         VkImageMemoryBarrier dst_release_barrier = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .oldLayout = export_probe.enabled
+                             ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                             : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT |
+                             VK_ACCESS_TRANSFER_READ_BIT,
             .dstAccessMask = 0,
             .srcQueueFamilyIndex = queueFamilyIndex,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
@@ -2012,15 +2358,11 @@ static NTSTATUS run_source(void *args) {
                     .layerCount = 1,
                 },
         };
-        VkImageMemoryBarrier post_blit_barriers[2] = {
-            source_release_barrier,
-            dst_release_barrier,
-        };
 
         vkCmdPipelineBarrier(source->commandBuffer,
                              VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL,
-                             0, NULL, 2, post_blit_barriers);
+                             0, NULL, 1, &dst_release_barrier);
 
         CHECK_VK_RESULT(vkEndCommandBuffer(source->commandBuffer)) {
             ERR("Failed to end command buffer\n");
@@ -2059,6 +2401,21 @@ static NTSTATUS run_source(void *args) {
         }
         pthread_mutex_unlock(&vk_lock);
 
+        /*
+         * The PipeWire buffer's release semaphore is exported during enqueue.
+         * Wait for the submit fence before that export so GL/EGL consumers never
+         * observe a queued DMA-BUF before the Vulkan blit has completed.
+         */
+        CHECK_VK_RESULT(vkWaitForFences(device, 1, &fence, VK_TRUE,
+                                        UINT64_MAX)) {
+            ERR("Failed to wait for Vulkan copy fence\n");
+            unlock_texture(source->receiver);
+            funnel_stream_return(source->stream, buf);
+            goto cont;
+        }
+        log_export_probe_stats(&source_probe);
+        log_export_probe_stats(&export_probe);
+
         TRACE("run_source(): Enqueueing\n");
 
         ret = funnel_stream_enqueue(source->stream, buf);
@@ -2067,17 +2424,13 @@ static NTSTATUS run_source(void *args) {
             funnel_stream_return(source->stream, buf);
         }
 
-        TRACE("run_source(): Wait for idle\n");
-
-        pthread_mutex_lock(&vk_lock);
-        CHECK_VK_RESULT(vkQueueWaitIdle(queue)) {}
-        pthread_mutex_unlock(&vk_lock);
-
         TRACE("run_source(): Unlock\n");
 
         unlock_texture(source->receiver);
 
     cont:
+        destroy_export_probe(&source_probe);
+        destroy_export_probe(&export_probe);
         pthread_mutex_lock(&source->lock);
         if (result != VK_SUCCESS) {
             ERR("Vulkan error (device lost?), stopping source permanently\n");

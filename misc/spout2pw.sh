@@ -464,35 +464,42 @@ prepare_prefix() {
 
 }
 
-write_runtime_config() {
-    runtime_config="$cdrive/spout2pw-runtime.env"
+write_runtime_env_value() {
+    local name="$1"
+    local value="${!name-}"
+
+    [ -n "$value" ] || return 0
+    printf '%s=%s\n' "$name" "$value"
+}
+
+write_runtime_config_file() {
+    local runtime_config="$1"
+
     log "Writing Spout2PW runtime config to $runtime_config"
-
-    write_runtime_env() {
-        local name="$1"
-        local value="${!name-}"
-
-        [ -n "$value" ] || return 0
-        printf '%s=%s\n' "$name" "$value"
-    }
-
+    mkdir -p "$(dirname "$runtime_config")"
     {
-        write_runtime_env SPOUT2PW_APPNAME
-        write_runtime_env SPOUT2PW_INSTANCE
-        write_runtime_env SPOUT2PW_OUTPUT_BACKEND
-        write_runtime_env SPOUT2PW_OUTPUT_WIDTH
-        write_runtime_env SPOUT2PW_OUTPUT_HEIGHT
-        write_runtime_env SPOUT2PW_FPS
-        write_runtime_env SPOUT2PW_STANDALONE
-        write_runtime_env SPOUT2PW_NODE_PREFIX
-        write_runtime_env SPOUT2PW_SENDER_NAME
-        write_runtime_env SPOUT2PW_VULKAN_DEVICE_BUS_ID
-        write_runtime_env SPOUT2PW_VULKAN_RENDER_NODE
-        write_runtime_env PIPEWIRE_CONTRACT_EXPECTED_SENDER_NAME
+        write_runtime_env_value SPOUT2PW_APPNAME
+        write_runtime_env_value SPOUT2PW_INSTANCE
+        write_runtime_env_value SPOUT2PW_OUTPUT_BACKEND
+        write_runtime_env_value SPOUT2PW_OUTPUT_WIDTH
+        write_runtime_env_value SPOUT2PW_OUTPUT_HEIGHT
+        write_runtime_env_value SPOUT2PW_FPS
+        write_runtime_env_value SPOUT2PW_STANDALONE
+        write_runtime_env_value SPOUT2PW_NODE_PREFIX
+        write_runtime_env_value SPOUT2PW_SENDER_NAME
+        write_runtime_env_value SPOUT2PW_VULKAN_DEVICE_BUS_ID
+        write_runtime_env_value SPOUT2PW_VULKAN_RENDER_NODE
+        write_runtime_env_value SPOUT2PW_EXPORT_PROBE_FRAMES
+        write_runtime_env_value PIPEWIRE_CONTRACT_EXPECTED_SENDER_NAME
         if [ "${quiet:-0}" = 1 ]; then
             printf '%s\n' "SPOUT2PW_NO_ERROR_DIALOG=1"
         fi
     } > "$runtime_config"
+}
+
+write_runtime_config() {
+    write_runtime_config_file "$cdrive/spout2pw-runtime.env"
+    write_runtime_config_file "/tmp/spout2pw-runtime-$(id -u).env"
 }
 
 prepare_proton() {
