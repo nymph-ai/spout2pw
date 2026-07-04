@@ -1897,11 +1897,13 @@ static NTSTATUS run_source(void *args) {
 
         /*
          * See: https://github.com/KhronosGroup/Vulkan-Docs/issues/2652
-         * GENERAL -> GENERAL layout transition is correct for external images
-         * VK_QUEUE_FAMILY_EXTERNAL synchronizes with external producer
-         * (though dxvk does not do the queue thing itself...)
+         * GENERAL -> GENERAL layout transition is correct for external source
+         * images. The PipeWire destination image still needs an explicit
+         * external ownership acquire plus a transfer layout before the blit,
+         * otherwise NVIDIA can expose a successfully-imported but still-zero
+         * DMA-BUF to GL consumers.
          */
-        VkImageMemoryBarrier barrier = {
+        VkImageMemoryBarrier source_acquire_barrier = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
@@ -1921,11 +1923,33 @@ static NTSTATUS run_source(void *args) {
                     .layerCount = 1,
                 },
         };
+        VkImageMemoryBarrier dst_acquire_barrier = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+            .dstQueueFamilyIndex = queueFamilyIndex,
+            .image = image,
+            .subresourceRange =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+        };
+        VkImageMemoryBarrier pre_blit_barriers[2] = {
+            source_acquire_barrier,
+            dst_acquire_barrier,
+        };
 
         vkCmdPipelineBarrier(source->commandBuffer,
                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
-                             NULL, 1, &barrier);
+                             NULL, 2, pre_blit_barriers);
 
         VkImageBlit region = {
             .srcSubresource =
@@ -1951,6 +1975,52 @@ static NTSTATUS run_source(void *args) {
                        VK_IMAGE_LAYOUT_GENERAL, image,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
                        VK_FILTER_NEAREST);
+
+        VkImageMemoryBarrier source_release_barrier = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = 0,
+            .srcQueueFamilyIndex = queueFamilyIndex,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+            .image = source->image,
+            .subresourceRange =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+        };
+        VkImageMemoryBarrier dst_release_barrier = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = 0,
+            .srcQueueFamilyIndex = queueFamilyIndex,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+            .image = image,
+            .subresourceRange =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+        };
+        VkImageMemoryBarrier post_blit_barriers[2] = {
+            source_release_barrier,
+            dst_release_barrier,
+        };
+
+        vkCmdPipelineBarrier(source->commandBuffer,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL,
+                             0, NULL, 2, post_blit_barriers);
 
         CHECK_VK_RESULT(vkEndCommandBuffer(source->commandBuffer)) {
             ERR("Failed to end command buffer\n");
