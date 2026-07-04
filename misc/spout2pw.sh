@@ -321,6 +321,8 @@ build_spout2pw_runtime_env_args() {
     add_runtime_env SPOUT2PW_APPNAME
     add_runtime_env SPOUT2PW_INSTANCE
     add_runtime_env SPOUT2PW_OUTPUT_BACKEND
+    add_runtime_env SPOUT2PW_OUTPUT_WIDTH
+    add_runtime_env SPOUT2PW_OUTPUT_HEIGHT
     add_runtime_env SPOUT2PW_FPS
     add_runtime_env SPOUT2PW_VALIDATION
     add_runtime_env SPOUT2PW_STANDALONE
@@ -478,6 +480,8 @@ write_runtime_config() {
         write_runtime_env SPOUT2PW_APPNAME
         write_runtime_env SPOUT2PW_INSTANCE
         write_runtime_env SPOUT2PW_OUTPUT_BACKEND
+        write_runtime_env SPOUT2PW_OUTPUT_WIDTH
+        write_runtime_env SPOUT2PW_OUTPUT_HEIGHT
         write_runtime_env SPOUT2PW_FPS
         write_runtime_env SPOUT2PW_STANDALONE
         write_runtime_env SPOUT2PW_NODE_PREFIX

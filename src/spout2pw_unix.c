@@ -573,6 +573,52 @@ static struct funnel_fraction get_default_stream_rate(void) {
     return FUNNEL_FRACTION((uint32_t)fps, 1);
 }
 
+static bool parse_output_dimension(const char *name, uint32_t *value) {
+    char raw_value[64];
+    const char *raw = runtime_setting(name, raw_value, sizeof(raw_value));
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!raw || !raw[0])
+        return false;
+
+    errno = 0;
+    parsed = strtoul(raw, &end, 10);
+    if (errno || !end || *end || parsed == 0 || parsed > 16384) {
+        WARN("Ignoring invalid %s=%s\n", name, raw);
+        return false;
+    }
+
+    *value = (uint32_t)parsed;
+    return true;
+}
+
+static void get_output_size(uint32_t source_width, uint32_t source_height,
+                            uint32_t *output_width,
+                            uint32_t *output_height) {
+    uint32_t requested_width = 0;
+    uint32_t requested_height = 0;
+    bool have_width =
+        parse_output_dimension("SPOUT2PW_OUTPUT_WIDTH", &requested_width);
+    bool have_height =
+        parse_output_dimension("SPOUT2PW_OUTPUT_HEIGHT", &requested_height);
+
+    *output_width = source_width;
+    *output_height = source_height;
+
+    if (have_width != have_height) {
+        WARN("Ignoring partial Spout2PW output size override; set both "
+             "SPOUT2PW_OUTPUT_WIDTH and SPOUT2PW_OUTPUT_HEIGHT\n");
+        return;
+    }
+
+    if (!have_width)
+        return;
+
+    *output_width = requested_width;
+    *output_height = requested_height;
+}
+
 static bool want_egl_output_backend(void) {
 #ifdef SPOUT2PW_ENABLE_EGL_BACKEND
     char value[64];
@@ -1746,9 +1792,20 @@ static NTSTATUS run_source(void *args) {
             } else if (source->info.flags & RECEIVER_TEXTURE_UPDATED) {
                 free_texture(source);
                 if (import_texture(source) == 0) {
-                    ret = funnel_stream_set_size(source->stream,
-                                                 source->info.width,
-                                                 source->info.height);
+                    uint32_t output_width;
+                    uint32_t output_height;
+                    get_output_size(source->info.width, source->info.height,
+                                    &output_width, &output_height);
+                    if (output_width != source->info.width ||
+                        output_height != source->info.height) {
+                        WARN("Publishing scaled Spout2PW output %ux%u from "
+                             "source %ux%u\n",
+                             output_width, output_height, source->info.width,
+                             source->info.height);
+                    }
+
+                    ret = funnel_stream_set_size(source->stream, output_width,
+                                                 output_height);
                     if (ret) {
                         ERR("Failed to set size\n");
                         continue;
@@ -1763,8 +1820,8 @@ static NTSTATUS run_source(void *args) {
                         ERR("Failed to start stream\n");
                         continue;
                     }
-                    source->width = source->info.width;
-                    source->height = source->info.height;
+                    source->width = output_width;
+                    source->height = output_height;
                     active = true;
                 } else {
                     ERR("Texture import failed, stopping stream\n");
@@ -1878,7 +1935,8 @@ static NTSTATUS run_source(void *args) {
                     .baseArrayLayer = 0,
                     .layerCount = 1,
                 },
-            .srcOffsets = {{0, 0, 0}, {bwidth, bheight, 1}},
+            .srcOffsets = {{0, 0, 0},
+                           {source->info.width, source->info.height, 1}},
             .dstSubresource =
                 {
                     .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
