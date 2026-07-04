@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -30,6 +29,8 @@ struct SpoutDXToCReceiver {
     uint32_t lastShareHandle;
     uint32_t lastAdapterId;
     ID3D11Texture2D *sharedTexture;
+    ID3D11Texture2D *receiveTexture;
+    HANDLE receiveShareHandle;
 
     spoutSenderNames sendernames;
     spoutFrameCount frame;
@@ -39,6 +40,14 @@ struct SpoutDXToCReceiver {
     bool texture_locked;
     bool dx_open;
 };
+
+static void ReleaseReceiveTexture(SPOUTDXTOC_RECEIVER *self) {
+    if (self->receiveTexture) {
+        self->receiveTexture->Release();
+        self->receiveTexture = nullptr;
+    }
+    self->receiveShareHandle = nullptr;
+}
 
 static std::vector<std::string> collect_allowed_sender_names(
     spoutSenderNames &sendernames) {
@@ -59,6 +68,16 @@ static std::vector<std::string> collect_allowed_sender_names(
     }
 
     return senderlist;
+}
+
+static std::string join_sender_names(const std::vector<std::string> &senderlist) {
+    std::string names;
+    for (size_t i = 0; i < senderlist.size(); i++) {
+        if (i != 0)
+            names += ", ";
+        names += senderlist[i];
+    }
+    return names;
 }
 
 static std::string configured_contract_sender_name() {
@@ -140,14 +159,22 @@ static std::vector<std::string> select_contract_sender_names(
             return {active_sender};
     }
 
-    std::string names;
-    for (size_t i = 0; i < senderlist.size(); i++) {
-        if (i != 0)
-            names += ", ";
-        names += senderlist[i];
-    }
+    const auto names = join_sender_names(senderlist);
 
     if (!configured_sender.empty()) {
+        if (senderlist.empty()) {
+            static bool logged_waiting = false;
+            if (!logged_waiting) {
+                SpoutLogNotice(
+                    "Waiting for configured Spout sender %s=%s within family "
+                    "prefix '%s'.",
+                    actaeid::pipewire_video_contract::SourceSelectedSenderEnvVar(),
+                    configured_sender.c_str(),
+                    actaeid::pipewire_video_contract::SourceSenderPrefix());
+                logged_waiting = true;
+            }
+            return {};
+        }
         SpoutLogError(
             "%s Contract violation for %s: expected selected sender %s=%s "
             "within family prefix '%s', found %zu matching senders [%s].",
@@ -349,6 +376,7 @@ void __stdcall SpoutDXToCFreeReceiver(SPOUTDXTOC_RECEIVER *self) {
         self->sharedTexture->Release();
         self->sharedTexture = nullptr;
     }
+    ReleaseReceiveTexture(self);
 
     if (self->dx_open)
         self->dx.CloseDirectX11();
@@ -380,6 +408,7 @@ static bool InitDXTexture(SPOUTDXTOC_RECEIVER *self, uint32_t shareHandle) {
         self->sharedTexture->Release();
         self->sharedTexture = nullptr;
     }
+    ReleaseReceiveTexture(self);
 
     if (!shareHandle)
         return false;
@@ -468,6 +497,18 @@ bool SpoutDXToCUpdateDXTexture(SPOUTDXTOC_RECEIVER *self,
     self->lastShareHandle = 0;
     self->texture_locked = false;
     bool success = InitDXTexture(self, HandleToLong(info->shareHandle));
+    if (success) {
+        success = self->dx.CreateSharedDX11Texture(
+            self->dx.GetDX11Device(), info->width, info->height,
+            (DXGI_FORMAT)info->format, &self->receiveTexture,
+            self->receiveShareHandle, false, false);
+        if (success) {
+            SpoutLogNotice(
+                "Receiver copy texture created [0x%0lX] for sender [0x%0lX]",
+                HandleToLong(self->receiveShareHandle),
+                HandleToLong(info->shareHandle));
+        }
+    }
 
     LeaveCriticalSection(&self->cs);
 
@@ -476,6 +517,7 @@ bool SpoutDXToCUpdateDXTexture(SPOUTDXTOC_RECEIVER *self,
 
     self->lastShareHandle = HandleToLong(info->shareHandle);
     info->adapterId = self->lastAdapterId;
+    info->shareHandle = self->receiveShareHandle;
 
     return true;
 }
@@ -489,6 +531,15 @@ bool __stdcall SpoutDXToCCheckTextureAccess(SPOUTDXTOC_RECEIVER *self) {
     if (self->sharedTexture) {
         self->texture_locked = ret =
             self->frame.CheckTextureAccess(self->sharedTexture);
+        if (ret && self->receiveTexture) {
+            ID3D11DeviceContext *ctx = self->dx.GetDX11Context();
+            if (ctx) {
+                ctx->CopyResource(self->receiveTexture, self->sharedTexture);
+                self->dx.FlushWait();
+            } else {
+                ret = false;
+            }
+        }
     }
 
     LeaveCriticalSection(&self->cs);
