@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -150,6 +151,181 @@ static const char *runtime_setting(const char *name, char *value,
     if (read_runtime_config(name, value, value_size))
         return value;
     return NULL;
+}
+
+static bool normalize_render_node_path(const char *path, char *value,
+                                       size_t value_size) {
+    char resolved[PATH_MAX];
+
+    if (!path || !path[0])
+        return false;
+    if (!realpath(path, resolved))
+        return false;
+
+    snprintf(value, value_size, "%s", resolved);
+    return true;
+}
+
+static bool xorg_bus_id_to_render_node(const char *raw, char *value,
+                                       size_t value_size) {
+    unsigned int bus = 0, device = 0, function = 0, domain = 0;
+    char by_path[PATH_MAX];
+
+    if (!raw || !raw[0])
+        return false;
+
+    if (strlen(raw) > 4 && tolower((unsigned char)raw[0]) == 'p' &&
+        tolower((unsigned char)raw[1]) == 'c' &&
+        tolower((unsigned char)raw[2]) == 'i' && raw[3] == ':') {
+        if (sscanf(raw + 4, "%u:%u:%u", &bus, &device, &function) != 3)
+            return false;
+    } else if (sscanf(raw, "%x:%x:%x.%x", &domain, &bus, &device,
+                      &function) != 4) {
+        return false;
+    }
+
+    snprintf(by_path, sizeof(by_path),
+             "/dev/dri/by-path/pci-%04x:%02x:%02x.%u-render", domain, bus,
+             device, function);
+    return normalize_render_node_path(by_path, value, value_size);
+}
+
+static bool requested_vulkan_render_node(char *value, size_t value_size) {
+    char raw_value[PATH_MAX];
+    const char *raw;
+
+    raw = runtime_setting("SPOUT2PW_VULKAN_RENDER_NODE", raw_value,
+                          sizeof(raw_value));
+    if (normalize_render_node_path(raw, value, value_size))
+        return true;
+    if (raw && raw[0])
+        WARN("Ignoring invalid SPOUT2PW_VULKAN_RENDER_NODE=%s\n", raw);
+
+    raw = runtime_setting("SPOUT2PW_VULKAN_DEVICE_BUS_ID", raw_value,
+                          sizeof(raw_value));
+    if (!raw || !raw[0])
+        raw = runtime_setting("VTUBER_XORG_BUS_ID", raw_value,
+                              sizeof(raw_value));
+    if (xorg_bus_id_to_render_node(raw, value, value_size))
+        return true;
+    if (raw && raw[0])
+        WARN("Ignoring invalid Vulkan PCI BusID=%s\n", raw);
+
+    return false;
+}
+
+static bool physical_device_render_node(VkInstance vk_instance,
+                                        VkPhysicalDevice device, char *value,
+                                        size_t value_size) {
+    PFN_vkGetPhysicalDeviceProperties2KHR get_properties2 =
+        (PFN_vkGetPhysicalDeviceProperties2KHR)vkGetInstanceProcAddr(
+            vk_instance, "vkGetPhysicalDeviceProperties2");
+    VkPhysicalDeviceDrmPropertiesEXT drm_props = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT};
+    VkPhysicalDeviceProperties2 properties = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &drm_props,
+    };
+    char render_node[64];
+
+    if (!get_properties2)
+        get_properties2 =
+            (PFN_vkGetPhysicalDeviceProperties2KHR)vkGetInstanceProcAddr(
+                vk_instance, "vkGetPhysicalDeviceProperties2KHR");
+    if (!get_properties2)
+        return false;
+
+    get_properties2(device, &properties);
+    if (!drm_props.hasRender)
+        return false;
+
+    if (drm_props.renderMinor >= 128)
+        snprintf(render_node, sizeof(render_node), "/dev/dri/renderD%d",
+                 (int)drm_props.renderMinor);
+    else
+        snprintf(render_node, sizeof(render_node), "/dev/dri/card%d",
+                 (int)drm_props.renderMinor);
+
+    return normalize_render_node_path(render_node, value, value_size);
+}
+
+static uint32_t physical_device_score(VkPhysicalDevice device) {
+    VkPhysicalDeviceProperties properties;
+
+    vkGetPhysicalDeviceProperties(device, &properties);
+
+    switch (properties.deviceType) {
+    default:
+        return 0;
+    case VK_PHYSICAL_DEVICE_TYPE_OTHER:
+        return 1;
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+        return 4;
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+        return 5;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+        return 3;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:
+        return 2;
+    }
+}
+
+static VkPhysicalDevice select_physical_device(VkInstance vk_instance,
+                                               VkPhysicalDevice *devices,
+                                               uint32_t count) {
+    char target_render_node[PATH_MAX];
+    uint32_t best_score = 0;
+    VkPhysicalDevice selected = VK_NULL_HANDLE;
+
+    if (requested_vulkan_render_node(target_render_node,
+                                     sizeof(target_render_node))) {
+        WARN("Selecting Vulkan device for render node %s\n",
+             target_render_node);
+        for (uint32_t i = 0; i < count; i++) {
+            char render_node[PATH_MAX];
+            VkPhysicalDeviceProperties properties;
+
+            if (!physical_device_render_node(vk_instance, devices[i],
+                                             render_node, sizeof(render_node)))
+                continue;
+            if (strcmp(render_node, target_render_node))
+                continue;
+
+            vkGetPhysicalDeviceProperties(devices[i], &properties);
+            WARN("Selected Vulkan device %s for render node %s\n",
+                 properties.deviceName, render_node);
+            return devices[i];
+        }
+
+        WARN("No Vulkan physical device matched requested render node %s; "
+             "falling back to default scoring\n",
+             target_render_node);
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t score = physical_device_score(devices[i]);
+
+        if (score > best_score) {
+            selected = devices[i];
+            best_score = score;
+        }
+    }
+
+    if (selected != VK_NULL_HANDLE) {
+        char render_node[PATH_MAX];
+        VkPhysicalDeviceProperties properties;
+
+        vkGetPhysicalDeviceProperties(selected, &properties);
+        if (physical_device_render_node(vk_instance, selected, render_node,
+                                        sizeof(render_node))) {
+            WARN("Selected Vulkan device %s for render node %s\n",
+                 properties.deviceName, render_node);
+        } else {
+            WARN("Selected Vulkan device %s\n", properties.deviceName);
+        }
+    }
+
+    return selected;
 }
 
 #define CHECK_VK_STARTUP(_expr)                                                \
@@ -685,44 +861,18 @@ static NTSTATUS startup(void *args) {
 
     uint32_t physDeviceCount;
     vkEnumeratePhysicalDevices(instance, &physDeviceCount, NULL);
+    if (physDeviceCount == 0) {
+        ERROR_MSG("No Vulkan physical devices");
+        return STATUS_FATAL_APP_EXIT;
+    }
 
     VkPhysicalDevice physDevices[physDeviceCount];
     vkEnumeratePhysicalDevices(instance, &physDeviceCount, physDevices);
 
-    uint32_t bestScore = 0;
-
-    for (uint32_t i = 0; i < physDeviceCount; i++) {
-        VkPhysicalDevice device = physDevices[i];
-
-        VkPhysicalDeviceProperties properties;
-        vkGetPhysicalDeviceProperties(device, &properties);
-
-        uint32_t score;
-
-        switch (properties.deviceType) {
-        default:
-            continue;
-        case VK_PHYSICAL_DEVICE_TYPE_OTHER:
-            score = 1;
-            break;
-        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
-            score = 4;
-            break;
-        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
-            score = 5;
-            break;
-        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
-            score = 3;
-            break;
-        case VK_PHYSICAL_DEVICE_TYPE_CPU:
-            score = 2;
-            break;
-        }
-
-        if (score > bestScore) {
-            physDevice = device;
-            bestScore = score;
-        }
+    physDevice = select_physical_device(instance, physDevices, physDeviceCount);
+    if (physDevice == VK_NULL_HANDLE) {
+        ERROR_MSG("No suitable Vulkan physical device");
+        return STATUS_FATAL_APP_EXIT;
     }
 
     {

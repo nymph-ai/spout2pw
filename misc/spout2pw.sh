@@ -326,6 +326,8 @@ build_spout2pw_runtime_env_args() {
     add_runtime_env SPOUT2PW_STANDALONE
     add_runtime_env SPOUT2PW_NODE_PREFIX
     add_runtime_env SPOUT2PW_SENDER_NAME
+    add_runtime_env SPOUT2PW_VULKAN_DEVICE_BUS_ID
+    add_runtime_env SPOUT2PW_VULKAN_RENDER_NODE
     add_runtime_env PIPEWIRE_CONTRACT_EXPECTED_SENDER_NAME
 
     if [ -n "${LD_LIBRARY_PATH:-}" ]; then
@@ -480,6 +482,8 @@ write_runtime_config() {
         write_runtime_env SPOUT2PW_STANDALONE
         write_runtime_env SPOUT2PW_NODE_PREFIX
         write_runtime_env SPOUT2PW_SENDER_NAME
+        write_runtime_env SPOUT2PW_VULKAN_DEVICE_BUS_ID
+        write_runtime_env SPOUT2PW_VULKAN_RENDER_NODE
         write_runtime_env PIPEWIRE_CONTRACT_EXPECTED_SENDER_NAME
         if [ "${quiet:-0}" = 1 ]; then
             printf '%s\n' "SPOUT2PW_NO_ERROR_DIALOG=1"
