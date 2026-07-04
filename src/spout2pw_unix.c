@@ -1716,8 +1716,8 @@ static NTSTATUS run_source(void *args) {
         };
 
         vkCmdPipelineBarrier(source->commandBuffer,
-                             VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
-                             VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 0, NULL, 0,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
                              NULL, 1, &barrier);
 
         VkImageBlit region = {
@@ -1750,8 +1750,7 @@ static NTSTATUS run_source(void *args) {
             goto cont;
         }
 
-        const VkPipelineStageFlags waitStage =
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 
         VkSubmitInfo submitInfo = {0};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;

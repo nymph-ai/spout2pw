@@ -8,7 +8,46 @@ pw_builddir="$base/build-pw"
 pw_srcdir="$base/subprojects/pipewire-static"
 enable_egl_backend="${SPOUT2PW_ENABLE_EGL_BACKEND:-false}"
 
-mkdir -p "$pw_builddir"
+prepare_builddir() {
+    local dir="$1"
+    local source_root="$2"
+    local marker="$dir/.spout2pw-source-root"
+
+    if [ -e "$dir"/build.ninja ]; then
+        if [ ! -e "$marker" ] || [ "$(cat "$marker")" != "$source_root" ]; then
+            rm -rf "$dir"
+        fi
+    fi
+
+    mkdir -p "$dir"
+}
+
+mark_builddir() {
+    local dir="$1"
+    local source_root="$2"
+    printf '%s\n' "$source_root" > "$dir/.spout2pw-source-root"
+}
+
+meson_setup_main() {
+    if [ -e "$builddir"/build.ninja ]; then
+        meson setup --reconfigure \
+            --native-file "$builddir/native.txt" \
+            --cross-file "$base"/misc/x86_64-w64-mingw32.txt \
+            -Dlibpipewire_static_lib="$builddir/prefix/usr/lib/libpipewire-static-0.3.a" \
+            -Denable_egl_backend="$enable_egl_backend" \
+            "$builddir" "$base" || { cat "$builddir/meson-logs/meson-log.txt"; false; }
+    else
+        meson setup \
+            --native-file "$builddir/native.txt" \
+            --cross-file "$base"/misc/x86_64-w64-mingw32.txt \
+            -Dlibpipewire_static_lib="$builddir/prefix/usr/lib/libpipewire-static-0.3.a" \
+            -Denable_egl_backend="$enable_egl_backend" \
+            "$builddir" "$base" || { cat "$builddir/meson-logs/meson-log.txt"; false; }
+    fi
+}
+
+prepare_builddir "$builddir" "$base"
+prepare_builddir "$pw_builddir" "$pw_srcdir"
 
 if [ ! -e "$pw_builddir"/build.ninja ]; then
     meson setup "$pw_builddir" "$pw_srcdir" \
@@ -45,6 +84,7 @@ if [ ! -e "$pw_builddir"/build.ninja ]; then
         -Dstatic=true \
         -Dlibdir=lib
 fi
+mark_builddir "$pw_builddir" "$pw_srcdir"
 
 echo "building"
 ninja -C "$pw_builddir"
@@ -56,11 +96,6 @@ cat > "$builddir/native.txt" <<EOF
 pkg_config_path='$builddir/prefix/usr/lib/pkgconfig'
 EOF
 
-meson setup \
-    --native-file "$builddir/native.txt" \
-    --cross-file "$base"/misc/x86_64-w64-mingw32.txt \
-    -Dlibpipewire_static_lib="$builddir/prefix/usr/lib/libpipewire-static-0.3.a" \
-    -Denable_egl_backend="$enable_egl_backend" \
-    "$builddir" "$base" || { cat build/meson-logs/meson-log.txt; false; }
-
+meson_setup_main
+mark_builddir "$builddir" "$base"
 ninja -C "$builddir" install

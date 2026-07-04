@@ -359,7 +359,7 @@ static struct source_info get_receiver_info(struct receiver *receiver) {
         return ret;
     }
 
-    HANDLE share_handle = info.shareHandle;
+    HANDLE sender_share_handle = info.shareHandle;
 
     TRACE("Sender %s: %dx%d fmt=%d handle=0x%lx usage=0x%x changed=%d\n",
           receiver->name, info.width, info.height, info.format,
@@ -375,29 +375,14 @@ static struct source_info get_receiver_info(struct receiver *receiver) {
 
     receiver->force_update = true;
 
-    int fd;
-    NTSTATUS status;
-    IO_STATUS_BLOCK iosb;
-    obj_handle_t unix_resource;
-    HANDLE memhandle = open_shared_resource(info.shareHandle);
-    if (memhandle == INVALID_HANDLE_VALUE) {
-        ret.flags |= RECEIVER_TEXTURE_INVALID;
-        WARN("Share handle open failed\n");
-        return ret;
-    }
-
-    TRACE("Share handle opened: 0x%lx -> 0x%lx\n", HandleToLong(share_handle),
-          HandleToLong(memhandle));
-
     Sleep(50);
 
     if (!SpoutDXToCGetSenderInfo(spout, &info) ||
-        info.shareHandle != share_handle) {
+        info.shareHandle != sender_share_handle) {
         WARN("Texture changed out under us, trying again later (0x%lx -> "
              "0x%lx)\n",
-             HandleToLong(share_handle), HandleToLong(info.shareHandle));
+             HandleToLong(sender_share_handle), HandleToLong(info.shareHandle));
         ret.flags |= RECEIVER_TEXTURE_INVALID;
-        NtClose(memhandle);
         return ret;
     }
 
@@ -410,9 +395,24 @@ static struct source_info get_receiver_info(struct receiver *receiver) {
     if (!SpoutDXToCUpdateDXTexture(spout, &info)) {
         WARN("Failed to update DX texture\n");
         ret.flags |= RECEIVER_TEXTURE_INVALID;
-        NtClose(memhandle);
         return ret;
     }
+
+    int fd;
+    NTSTATUS status;
+    IO_STATUS_BLOCK iosb;
+    obj_handle_t unix_resource;
+    HANDLE memhandle = open_shared_resource(info.shareHandle);
+    if (memhandle == INVALID_HANDLE_VALUE) {
+        ret.flags |= RECEIVER_TEXTURE_INVALID;
+        WARN("Share handle open failed\n");
+        return ret;
+    }
+
+    TRACE("Receiver share handle opened: sender=0x%lx receiver=0x%lx -> "
+          "0x%lx\n",
+          HandleToLong(sender_share_handle), HandleToLong(info.shareHandle),
+          HandleToLong(memhandle));
 
     uint32_t ret_size;
     struct DxvkSharedTextureMetadata metadata;
